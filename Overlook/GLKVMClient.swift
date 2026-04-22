@@ -68,6 +68,28 @@ struct GLKVMSystemConfig: Codable, Hashable {
         case fingerbotStrength = "fingerbot_strength"
         case videoProcessing = "video_processing"
     }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        shortcuts = (try? c.decode([GLKVMSystemConfigShortcut].self, forKey: .shortcuts)) ?? []
+        orientation = (try? c.decode(Int.self, forKey: .orientation)) ?? 0
+        streamQuality = (try? c.decode(Int.self, forKey: .streamQuality)) ?? 80
+        videoMode = (try? c.decode(String.self, forKey: .videoMode)) ?? ""
+        showCursor = (try? c.decode(Bool.self, forKey: .showCursor)) ?? true
+        mousePolling = (try? c.decode(Int.self, forKey: .mousePolling)) ?? 10
+        mouseControl = (try? c.decode(Bool.self, forKey: .mouseControl)) ?? true
+        relativeSense = (try? c.decode(Int.self, forKey: .relativeSense)) ?? 10
+        scrollRate = (try? c.decode(Int.self, forKey: .scrollRate)) ?? 1
+        reverseScrolling = (try? c.decode(String.self, forKey: .reverseScrolling)) ?? "STANDARD"
+        keyboardControl = (try? c.decode(Bool.self, forKey: .keyboardControl)) ?? true
+        themeMode = (try? c.decode(String.self, forKey: .themeMode)) ?? "auto"
+        mouseJiggle = (try? c.decode(Bool.self, forKey: .mouseJiggle)) ?? false
+        keymap = (try? c.decode(String.self, forKey: .keymap)) ?? "en-us"
+        gotMutedPanelTip = (try? c.decode(Bool.self, forKey: .gotMutedPanelTip)) ?? false
+        isAbsoluteMouse = (try? c.decode(Bool.self, forKey: .isAbsoluteMouse)) ?? true
+        fingerbotStrength = (try? c.decode(Int.self, forKey: .fingerbotStrength)) ?? 0
+        videoProcessing = (try? c.decode(String.self, forKey: .videoProcessing)) ?? ""
+    }
 }
 
 struct GLKVMTurnCredentials: Decodable {

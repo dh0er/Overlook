@@ -22,6 +22,9 @@ struct VideoSurfaceView: View {
     @State private var ocrDragCurrent: CGPoint?
     @State private var ocrRegionsTask: Task<Void, Never>?
 
+    @State private var isHoveringStream = false
+    @AppStorage(TrackingContainerView.hideSystemCursorDefaultsKey) private var hideSystemCursorOverStream: Bool = false
+
     private var ocrSelectionRect: CGRect? {
         guard let start = ocrDragStart, let current = ocrDragCurrent else { return nil }
         let x = min(start.x, current.x)
@@ -142,6 +145,17 @@ struct VideoSurfaceView: View {
                     .padding()
                 }
             }
+            .contentShape(Rectangle())
+            .onContinuousHover(coordinateSpace: .local) { phase in
+                switch phase {
+                case .active(let location):
+                    let rect = videoContentRect(viewSize: geometry.size)
+                    isHoveringStream = rect.contains(location)
+                case .ended:
+                    isHoveringStream = false
+                }
+                StreamCursorHider.shared.update(shouldHide: isHoveringStream && hideSystemCursorOverStream)
+            }
         }
         .onChange(of: isOCRModeEnabled) { _, enabled in
             setOCRMode(enabled)
@@ -152,6 +166,30 @@ struct VideoSurfaceView: View {
         .onDisappear {
             ocrRegionsTask?.cancel()
             ocrRegionsTask = nil
+            isHoveringStream = false
+            StreamCursorHider.shared.update(shouldHide: false)
+        }
+        .onChange(of: hideSystemCursorOverStream) { _, newValue in
+            StreamCursorHider.shared.update(shouldHide: isHoveringStream && newValue)
+        }
+    }
+
+    private func videoContentRect(viewSize: CGSize) -> CGRect {
+        guard viewSize.width > 0, viewSize.height > 0,
+              let videoSize = currentVideoSize(),
+              videoSize.width > 0, videoSize.height > 0 else {
+            return CGRect(origin: .zero, size: viewSize)
+        }
+        let viewAspect = viewSize.width / viewSize.height
+        let videoAspect = videoSize.width / videoSize.height
+        if viewAspect > videoAspect {
+            let contentWidth = viewSize.height * videoAspect
+            let xOffset = (viewSize.width - contentWidth) / 2.0
+            return CGRect(x: xOffset, y: 0, width: contentWidth, height: viewSize.height)
+        } else {
+            let contentHeight = viewSize.width / videoAspect
+            let yOffset = (viewSize.height - contentHeight) / 2.0
+            return CGRect(x: 0, y: yOffset, width: viewSize.width, height: contentHeight)
         }
     }
 
@@ -280,6 +318,8 @@ final class TrackingContainerView: NSView {
     var onMouseMove: ((CGPoint) -> Void)?
     var onMouseButton: ((MouseButton, Bool, CGPoint) -> Void)?
     var onScrollWheel: ((CGFloat, CGFloat) -> Void)?
+
+    static let hideSystemCursorDefaultsKey = "overlook.hideSystemCursorOverStream"
 
     private var trackingAreaRef: NSTrackingArea?
     private var lastMoveTimestamp: TimeInterval = 0
@@ -426,3 +466,30 @@ final class TrackingContainerView: NSView {
     }
 }
 #endif
+
+@MainActor
+final class StreamCursorHider {
+    static let shared = StreamCursorHider()
+
+    private var hidden = false
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.update(shouldHide: false) }
+        }
+    }
+
+    func update(shouldHide: Bool) {
+        if shouldHide && !hidden {
+            NSCursor.hide()
+            hidden = true
+        } else if !shouldHide && hidden {
+            NSCursor.unhide()
+            hidden = false
+        }
+    }
+}
