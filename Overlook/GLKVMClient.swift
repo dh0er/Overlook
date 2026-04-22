@@ -234,7 +234,8 @@ final class GLKVMClient {
     private let session: URLSession
 
     init(host: String, port: Int = 443, authToken: String? = nil, allowInsecureTLS: Bool = true) throws {
-        guard let url = URL(string: "https://\(host):\(port)") else {
+        let scheme = (port == 80 || port == 8080) ? "http" : "https"
+        guard let url = URL(string: "\(scheme)://\(host):\(port)") else {
             throw ClientError.invalidBaseURL
         }
 
@@ -314,6 +315,8 @@ final class GLKVMClient {
         do {
             return try decoder.decode(Response.self, from: data)
         } catch {
+            let preview = String(data: data.prefix(512), encoding: .utf8) ?? "<binary \(data.count)B>"
+            NSLog("[Overlook glkvm] decode failed for %@ (status=%d): %@ | body: %@", url.absoluteString, http.statusCode, "\(error)", preview)
             throw ClientError.decodingFailed
         }
     }
@@ -348,15 +351,37 @@ final class GLKVMClient {
         body.append("\(password)\r\n".data(using: .utf8) ?? Data())
         body.append("--\(boundary)--\r\n".data(using: .utf8) ?? Data())
 
-        let response = try await request(
-            method: "POST",
-            path: "api/auth/login",
-            body: body,
-            contentType: "multipart/form-data; boundary=\(boundary)",
-            responseType: GLKVMResponse<GLKVMAuthLoginResult>.self
-        )
+        // Some firmware returns the token in the JSON body (`result.token`),
+        // others return an empty result and set the token via Set-Cookie.
+        // Try the body first, fall back to the cookie.
+        let url = try makeURL(path: "api/auth/login")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-        return response.result.token
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw ClientError.decodingFailed
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let bodyString = String(data: data, encoding: .utf8)
+            throw ClientError.httpError(statusCode: http.statusCode, body: bodyString)
+        }
+
+        if let wrapped = try? JSONDecoder().decode(GLKVMResponse<GLKVMAuthLoginResult>.self, from: data) {
+            return wrapped.result.token
+        }
+
+        let headers = http.allHeaderFields as? [String: String] ?? [:]
+        let cookies = HTTPCookie.cookies(withResponseHeaderFields: headers, for: url)
+        if let token = cookies.first(where: { $0.name == "auth_token" })?.value {
+            return token
+        }
+
+        let preview = String(data: data.prefix(512), encoding: .utf8) ?? "<binary \(data.count)B>"
+        NSLog("[Overlook glkvm] login succeeded but no token found. body: %@", preview)
+        throw ClientError.decodingFailed
     }
 
     func getSystemConfig() async throws -> GLKVMSystemConfig {
@@ -431,7 +456,7 @@ final class GLKVMClient {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             throw ClientError.invalidURL
         }
-        components.scheme = "wss"
+        components.scheme = (baseURL.scheme == "https") ? "wss" : "ws"
         components.path = "/api/ws"
         guard let url = components.url else {
             throw ClientError.invalidURL
@@ -443,7 +468,7 @@ final class GLKVMClient {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             throw ClientError.invalidURL
         }
-        components.scheme = "wss"
+        components.scheme = (baseURL.scheme == "https") ? "wss" : "ws"
         components.path = "/api/media/ws"
         guard let url = components.url else {
             throw ClientError.invalidURL

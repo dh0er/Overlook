@@ -12,6 +12,7 @@ xcuserdata/
 
 # build script output
 build/
+log.txt
 
 # working paths
 glweb171/

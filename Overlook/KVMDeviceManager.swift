@@ -2,6 +2,7 @@ import Foundation
 import Network
 import Combine
 import CryptoKit
+import SystemConfiguration
 
 @MainActor
 final class KVMDeviceManager: NSObject, ObservableObject {
@@ -38,12 +39,6 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         return URLSession(configuration: config, delegate: InsecureTLSDelegate(), delegateQueue: nil)
     }()
 
-    private let commonProbeTargets: [(host: String, port: Int)] = [
-        ("192.168.200.5", 443),
-        ("192.168.200.1", 443),
-        ("192.168.200.1", 80),
-    ]
-
     private static let savedDevicesKey = "overlook.saved_devices.v1"
 
     private struct PersistedDevice: Codable, Hashable {
@@ -57,8 +52,20 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     
     override init() {
         super.init()
+        Self.raiseOpenFileLimit()
         setupNetworkMonitoring()
         loadPersistedDevices()
+    }
+
+    private static func raiseOpenFileLimit() {
+        // macOS default soft limit is 256. With concurrent scan probes plus
+        // URLSession's own connections we hit EMFILE and probes silently fail.
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
+        let desired: rlim_t = 4096
+        if limit.rlim_cur >= desired { return }
+        limit.rlim_cur = min(desired, limit.rlim_max)
+        _ = setrlimit(RLIMIT_NOFILE, &limit)
     }
     
     private func setupNetworkMonitoring() {
@@ -101,11 +108,6 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                     await self.scanKnownPorts()
                 }
 
-                // Quick probe for common/default KVM addresses
-                group.addTask {
-                    await self.probeCommonTargets()
-                }
-                
                 // Tailscale network discovery
                 group.addTask {
                     await self.discoverTailscaleDevices()
@@ -351,6 +353,10 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             }
         }
 
+        if prefixes.isEmpty, let primary = primaryRouteIPv4Prefix() {
+            prefixes.insert(primary)
+        }
+
         if prefixes.isEmpty {
             prefixes = [
                 "192.168.1",
@@ -359,9 +365,10 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             ]
         }
 
-        prefixes.insert("192.168.200")
+        let sortedPrefixes = prefixes.sorted()
+        NSLog("[Overlook scan] scanning prefixes: \(sortedPrefixes)")
 
-        for prefix in prefixes {
+        for prefix in sortedPrefixes {
             for i in 1...254 {
                 hosts.append("\(prefix).\(i)")
             }
@@ -370,85 +377,85 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         return hosts
     }
 
-    private func probeCommonTargets() async -> [KVMDevice] {
-        var devices: [KVMDevice] = []
-        for target in commonProbeTargets {
-            if let device = await checkKVMService(host: target.host, port: target.port) {
-                devices.append(device)
-                continue
-            }
-
-            // If the port is open but the HTTP probe didn't identify the service,
-            // still surface it for the common/default targets (helps with devices
-            // that redirect/behave oddly on probe endpoints).
-            if await probeTCPPortOpen(host: target.host, port: target.port) {
-                devices.append(
-                    KVMDevice(
-                        id: "scanned-\(target.host)-\(target.port)",
-                        name: "KVM @ \(target.host):\(target.port)",
-                        host: target.host,
-                        port: target.port,
-                        type: .glinetComet,
-                        authToken: "",
-                        capabilities: [.videoStreaming, .keyboardInput, .mouseInput, .virtualMedia, .powerManagement]
-                    )
-                )
-            }
+    private func primaryRouteIPv4Prefix() -> String? {
+        guard let store = SCDynamicStoreCreate(nil, "com.overlook.scan" as CFString, nil, nil) else {
+            return nil
         }
-        return devices
+        guard let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+              let primaryInterface = global["PrimaryInterface"] as? String else {
+            return nil
+        }
+        let key = "State:/Network/Interface/\(primaryInterface)/IPv4" as CFString
+        guard let ipv4 = SCDynamicStoreCopyValue(store, key) as? [String: Any],
+              let addresses = ipv4["Addresses"] as? [String],
+              let first = addresses.first else {
+            return nil
+        }
+        let parts = first.split(separator: ".")
+        guard parts.count == 4 else { return nil }
+        let p0 = Int(parts[0]) ?? 0
+        let p1 = Int(parts[1]) ?? 0
+        let isPrivate = (p0 == 10) || (p0 == 192 && p1 == 168) || (p0 == 172 && (16...31).contains(p1))
+        guard isPrivate else { return nil }
+        return "\(parts[0]).\(parts[1]).\(parts[2])"
     }
 
     private func probeTCPPortOpen(host: String, port: Int) async -> Bool {
-        guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
-            return false
-        }
-
-        final class Flag {
-            var value: Bool = false
-        }
-
-        let queue = DispatchQueue(label: "com.overlook.probe.port")
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
-
-        return await withCheckedContinuation { continuation in
-            let finished = Flag()
-
-            let timeoutWorkItem = DispatchWorkItem {
-                if finished.value { return }
-                finished.value = true
-                connection.stateUpdateHandler = nil
-                connection.cancel()
-                continuation.resume(returning: false)
+        // Raw POSIX socket connect — NWConnection emits ~4 [connection] os_log
+        // lines per failed probe and there's no way to silence them. With a
+        // /24 subnet × 4 ports that's thousands of log entries per scan.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: Self.rawTCPConnect(host: host, port: port, timeoutMs: 700))
             }
-
-            queue.asyncAfter(deadline: .now() + 0.7, execute: timeoutWorkItem)
-
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    if finished.value { return }
-                    finished.value = true
-                    timeoutWorkItem.cancel()
-                    connection.stateUpdateHandler = nil
-                    connection.cancel()
-                    continuation.resume(returning: true)
-                case .failed, .cancelled:
-                    if finished.value { return }
-                    finished.value = true
-                    timeoutWorkItem.cancel()
-                    connection.stateUpdateHandler = nil
-                    connection.cancel()
-                    continuation.resume(returning: false)
-                default:
-                    break
-                }
-            }
-
-            connection.start(queue: queue)
         }
+    }
+
+    nonisolated private static func rawTCPConnect(host: String, port: Int, timeoutMs: Int32) -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
+
+        let flags = fcntl(sock, F_GETFL, 0)
+        guard flags >= 0, fcntl(sock, F_SETFL, flags | O_NONBLOCK) >= 0 else { return false }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(port).bigEndian
+        guard inet_pton(AF_INET, host, &addr.sin_addr) == 1 else { return false }
+
+        let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        if connectResult == 0 { return true }
+        if errno != EINPROGRESS { return false }
+
+        var pfd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
+        let ready = withUnsafeMutablePointer(to: &pfd) { poll($0, 1, timeoutMs) }
+        guard ready > 0 else { return false }
+
+        let badFlags = Int16(POLLERR) | Int16(POLLHUP) | Int16(POLLNVAL)
+        if (pfd.revents & badFlags) != 0 { return false }
+        if (pfd.revents & Int16(POLLOUT)) == 0 { return false }
+
+        var soError: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &len) == 0 else { return false }
+        return soError == 0
     }
     
     private func checkKVMService(host: String, port: Int) async -> KVMDevice? {
+        // Skip the HTTP probes entirely if the TCP port isn't even open.
+        // This is the difference between a 0.7s NWConnection timeout and a
+        // 3s URLSession timeout that also emits a CFNetwork error log line.
+        guard await probeTCPPortOpen(host: host, port: port) else {
+            return nil
+        }
+
         if await probeGLKVM(host: host, port: port) {
             return KVMDevice(
                 id: "scanned-\(host)-\(port)",
@@ -574,18 +581,58 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
     
     private func removeDuplicates(from devices: [KVMDevice]) -> [KVMDevice] {
-        var uniqueDevices: [KVMDevice] = []
-        var seenHosts: Set<String> = []
-        
-        for device in devices {
-            let hostKey = "\(device.host):\(device.port)"
-            if !seenHosts.contains(hostKey) {
-                seenHosts.insert(hostKey)
-                uniqueDevices.append(device)
+        // Pinned (manual/saved) entries always appear with their exact host:port.
+        // Discovered entries collapse per host:port, and additionally surface
+        // when a host has a discovered port that isn't already pinned — so a
+        // saved :80 entry doesn't hide a freshly-discovered :443 entry.
+        func portRank(_ port: Int) -> Int {
+            switch port {
+            case 443: return 0
+            case 8443: return 1
+            case 80: return 2
+            case 8080: return 3
+            default: return 4
             }
         }
-        
-        return uniqueDevices
+
+        var pinned: [KVMDevice] = []
+        var pinnedKeys: Set<String> = []
+        var bestDiscoveredPerKey: [String: KVMDevice] = [:]
+        var pinnedHostPorts: [String: Set<Int>] = [:]
+
+        for device in devices {
+            let isPinned = device.id.hasPrefix("manual-") || device.id.hasPrefix("saved-")
+            let key = "\(device.host):\(device.port)"
+            if isPinned {
+                if pinnedKeys.insert(key).inserted {
+                    pinned.append(device)
+                    pinnedHostPorts[device.host, default: []].insert(device.port)
+                }
+            } else {
+                if let existing = bestDiscoveredPerKey[key] {
+                    if portRank(device.port) < portRank(existing.port) {
+                        bestDiscoveredPerKey[key] = device
+                    }
+                } else {
+                    bestDiscoveredPerKey[key] = device
+                }
+            }
+        }
+
+        var result = pinned
+        for device in bestDiscoveredPerKey.values {
+            let key = "\(device.host):\(device.port)"
+            if pinnedKeys.contains(key) { continue }
+            // Also skip a discovered entry if a pinned entry for the same host
+            // exists on a better-ranked port (saved :443 hides discovered :80).
+            if let pinnedPorts = pinnedHostPorts[device.host],
+               pinnedPorts.contains(where: { portRank($0) <= portRank(device.port) }) {
+                continue
+            }
+            result.append(device)
+        }
+
+        return result
     }
     
     @discardableResult
@@ -654,20 +701,29 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         guard let client = try? GLKVMClient(device: finalDevice, allowInsecureTLS: true) else {
             throw KVMError.connectionFailed
         }
+        NSLog("[Overlook connect] %@:%d baseURL=%@ tokenLen=%d", finalDevice.host, finalDevice.port, client.baseURL.absoluteString, finalDevice.authToken.count)
 
         do {
             try await client.authCheck()
+            NSLog("[Overlook connect] authCheck OK")
         } catch {
+            NSLog("[Overlook connect] authCheck threw: %@", "\(error)")
             if let password, !password.isEmpty {
-                let token = try await client.authLogin(user: user, password: password)
-                client.authToken = token
+                do {
+                    let token = try await client.authLogin(user: user, password: password)
+                    client.authToken = token
 
-                var updated = finalDevice
-                updated.authToken = token
-                if let index = availableDevices.firstIndex(where: { $0.id == updated.id }) {
-                    availableDevices[index] = updated
+                    var updated = finalDevice
+                    updated.authToken = token
+                    if let index = availableDevices.firstIndex(where: { $0.id == updated.id }) {
+                        availableDevices[index] = updated
+                    }
+                    finalDevice = updated
+                    NSLog("[Overlook connect] authLogin OK")
+                } catch {
+                    NSLog("[Overlook connect] authLogin threw: %@", "\(error)")
+                    throw error
                 }
-                finalDevice = updated
             } else {
                 throw KVMError.authenticationFailed
             }
@@ -816,7 +872,8 @@ struct KVMDevice: Identifiable, Codable {
     }
     
     var webRTCURL: String {
-        return "wss://\(host):\(port)/janus/ws"
+        let scheme = (port == 80 || port == 8080) ? "ws" : "wss"
+        return "\(scheme)://\(host):\(port)/janus/ws"
     }
 }
 
