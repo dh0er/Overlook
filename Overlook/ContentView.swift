@@ -260,7 +260,7 @@ struct ContentView: View {
                     }
                 )
                 .frame(width: 360)
-                .background(.ultraThinMaterial)
+                .background(.thickMaterial)
                 .padding(.top, 8)
 
                 Spacer(minLength: 0)
