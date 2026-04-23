@@ -115,7 +115,7 @@ struct VideoSurfaceView: View {
                         )
                 }
 
-                if webRTCManager.isConnecting || webRTCManager.isStreamStalled || (webRTCManager.hasEverConnectedToStream && !webRTCManager.isConnected) {
+                if isShowingStatusOverlay {
                     VStack(spacing: 10) {
                         Text(webRTCManager.isConnecting ? "Connecting…" : "Connection Lost")
                             .font(.headline)
@@ -154,7 +154,7 @@ struct VideoSurfaceView: View {
                 case .ended:
                     isHoveringStream = false
                 }
-                StreamCursorHider.shared.update(shouldHide: isHoveringStream && hideSystemCursorOverStream)
+                StreamCursorHider.shared.update(shouldHide: shouldHideCursor)
             }
         }
         .onChange(of: isOCRModeEnabled) { _, enabled in
@@ -169,9 +169,22 @@ struct VideoSurfaceView: View {
             isHoveringStream = false
             StreamCursorHider.shared.update(shouldHide: false)
         }
-        .onChange(of: hideSystemCursorOverStream) { _, newValue in
-            StreamCursorHider.shared.update(shouldHide: isHoveringStream && newValue)
+        .onChange(of: hideSystemCursorOverStream) { _, _ in
+            StreamCursorHider.shared.update(shouldHide: shouldHideCursor)
         }
+        .onChange(of: isShowingStatusOverlay) { _, _ in
+            StreamCursorHider.shared.update(shouldHide: shouldHideCursor)
+        }
+    }
+
+    private var isShowingStatusOverlay: Bool {
+        webRTCManager.isConnecting
+            || webRTCManager.isStreamStalled
+            || (webRTCManager.hasEverConnectedToStream && !webRTCManager.isConnected)
+    }
+
+    private var shouldHideCursor: Bool {
+        isHoveringStream && hideSystemCursorOverStream && !isShowingStatusOverlay
     }
 
     private func videoContentRect(viewSize: CGSize) -> CGRect {
