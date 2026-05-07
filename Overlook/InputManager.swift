@@ -36,6 +36,7 @@ class InputManager: ObservableObject {
     private var activeCommandKeyCode: UInt16?
     private var commandKeySentToRemote: Bool = false
     private var suppressedKeyUps: Set<UInt16> = []
+    private var passthroughKeyCodes: Set<UInt16> = []
     
     @Published var isKeyboardCaptureEnabled = false
     @Published var isMouseCaptureEnabled = false
@@ -193,14 +194,13 @@ class InputManager: ObservableObject {
             isKeyboardCaptureEnabled = true
             return
         }
-        
+
         isCapturing = true
         isKeyboardCaptureEnabled = true
-        
+
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
-            self?.handleKeyEvent(event)
             guard let self, self.isKeyboardCaptureEnabled else { return event }
-            return nil
+            return self.handleKeyEvent(event)
         }
     }
     
@@ -235,117 +235,193 @@ class InputManager: ObservableObject {
         }
     }
     
-    private func handleKeyEvent(_ event: NSEvent) {
-        guard isKeyboardCaptureEnabled else { return }
+    private func handleKeyEvent(_ event: NSEvent) -> NSEvent? {
+        guard isKeyboardCaptureEnabled else { return event }
+
+        if isSnippetModeActive {
+            return handleKeyEventDuringSnippet(event)
+        }
 
         switch event.type {
         case .keyDown, .keyUp:
-            let keyCode = event.keyCode
-            let isKeyDown = event.type == .keyDown
-            let modifiers = event.modifierFlags
-
-            if !isKeyDown, suppressedKeyUps.contains(keyCode) {
-                suppressedKeyUps.remove(keyCode)
-                return
-            }
-
-            if isKeyDown, modifiers.contains(.command) {
-                if keyCode == 8 {
-                    prepareForLocalCommandShortcut()
-                    suppressedKeyUps.insert(keyCode)
-                    NotificationCenter.default.post(name: .overlookToggleCopyMode, object: nil)
-                    return
-                }
-                if keyCode == 9 {
-                    prepareForLocalCommandShortcut()
-                    suppressedKeyUps.insert(keyCode)
-                    pasteClipboardToRemote()
-                    return
-                }
-
-                if let pending = pendingCommandKeyCode,
-                   commandKeySentToRemote == false,
-                   transportMode == .glkvmWebSocket,
-                   let ws = glkvmWebSocketClient,
-                   let metaKey = glkvmKeyForMacKeyCode(pending),
-                   let keyName = glkvmKeyForMacKeyCode(keyCode) {
-                    activeCommandKeyCode = pending
-                    pendingCommandKeyCode = nil
-                    commandKeySentToRemote = true
-
-                    Task {
-                        try? await ws.sendHidKey(key: metaKey, state: true)
-                        try? await ws.sendHidKey(key: keyName, state: true)
-                    }
-                    return
-                }
-
-                flushPendingCommandKeyIfNeeded(timestamp: event.timestamp, modifiers: modifiers)
-            }
-
-            let keyEvent = KeyEvent(
-                keyCode: keyCode,
-                isKeyDown: isKeyDown,
-                modifiers: modifiers,
-                timestamp: event.timestamp
-            )
-
-            sendKeyEvent(keyEvent)
-
+            return handleKeyDownOrUp(event)
         case .flagsChanged:
-            let keyCode = event.keyCode
-            guard let keyName = glkvmKeyForMacKeyCode(keyCode) else { return }
-
-            let flags = event.modifierFlags
-            let isDown: Bool
-            switch keyName {
-            case "ShiftLeft", "ShiftRight":
-                isDown = flags.contains(.shift)
-            case "ControlLeft", "ControlRight":
-                isDown = flags.contains(.control)
-            case "AltLeft", "AltRight":
-                isDown = flags.contains(.option)
-            case "MetaLeft", "MetaRight":
-                isDown = flags.contains(.command)
-                if isDown {
-                    pendingCommandKeyCode = keyCode
-                    activeCommandKeyCode = nil
-                    commandKeySentToRemote = false
-                    return
-                }
-
-                if commandKeySentToRemote {
-                    let keyEvent = KeyEvent(
-                        keyCode: activeCommandKeyCode ?? keyCode,
-                        isKeyDown: false,
-                        modifiers: flags,
-                        timestamp: event.timestamp
-                    )
-                    sendKeyEvent(keyEvent)
-                }
-
-                clearPendingCommandKey()
-                return
-            case "CapsLock":
-                isDown = flags.contains(.capsLock)
-            default:
-                return
-            }
-
-            let keyEvent = KeyEvent(
-                keyCode: keyCode,
-                isKeyDown: isDown,
-                modifiers: flags,
-                timestamp: event.timestamp
-            )
-            sendKeyEvent(keyEvent)
-
+            handleFlagsChanged(event)
+            return nil
         default:
-            break
+            return nil
         }
     }
 
-    private func prepareForLocalCommandShortcut() {
+    private func handleKeyEventDuringSnippet(_ event: NSEvent) -> NSEvent? {
+        if event.type == .keyDown, event.keyCode == 53 { // Escape
+            NotificationCenter.default.post(name: .overlookCancelSnippet, object: nil)
+        }
+        return nil
+    }
+
+    private func handleKeyDownOrUp(_ event: NSEvent) -> NSEvent? {
+        let keyCode = event.keyCode
+        let isKeyDown = event.type == .keyDown
+        let modifiers = event.modifierFlags
+
+        if !isKeyDown, passthroughKeyCodes.contains(keyCode) {
+            passthroughKeyCodes.remove(keyCode)
+            return event
+        }
+
+        if !isKeyDown, suppressedKeyUps.contains(keyCode) {
+            suppressedKeyUps.remove(keyCode)
+            return nil
+        }
+
+        if isKeyDown {
+            switch localActionFor(keyCode: keyCode, modifiers: modifiers) {
+            case .some(.passthrough):
+                releaseRemoteCommandForLocalShortcut()
+                passthroughKeyCodes.insert(keyCode)
+                return event
+            case .some(.pasteClipboard):
+                releaseRemoteCommandForLocalShortcut()
+                suppressedKeyUps.insert(keyCode)
+                pasteClipboardToRemote()
+                return nil
+            case .some(.startSnippet):
+                releaseRemoteCommandForLocalShortcut()
+                suppressedKeyUps.insert(keyCode)
+                NotificationCenter.default.post(name: .overlookStartSnippet, object: nil)
+                return nil
+            case .none:
+                break
+            }
+        }
+
+        if isKeyDown, modifiers.contains(.command) {
+            if let pending = pendingCommandKeyCode,
+               commandKeySentToRemote == false,
+               transportMode == .glkvmWebSocket,
+               let ws = glkvmWebSocketClient,
+               let metaKey = glkvmKeyForMacKeyCode(pending),
+               let keyName = glkvmKeyForMacKeyCode(keyCode) {
+                activeCommandKeyCode = pending
+                pendingCommandKeyCode = nil
+                commandKeySentToRemote = true
+
+                Task {
+                    try? await ws.sendHidKey(key: metaKey, state: true)
+                    try? await ws.sendHidKey(key: keyName, state: true)
+                }
+                return nil
+            }
+
+            flushPendingCommandKeyIfNeeded(timestamp: event.timestamp, modifiers: modifiers)
+        }
+
+        let keyEvent = KeyEvent(
+            keyCode: keyCode,
+            isKeyDown: isKeyDown,
+            modifiers: modifiers,
+            timestamp: event.timestamp
+        )
+
+        sendKeyEvent(keyEvent)
+        return nil
+    }
+
+    private func handleFlagsChanged(_ event: NSEvent) {
+        let keyCode = event.keyCode
+        guard let keyName = glkvmKeyForMacKeyCode(keyCode) else { return }
+
+        let flags = event.modifierFlags
+        let isDown: Bool
+        switch keyName {
+        case "ShiftLeft", "ShiftRight":
+            isDown = flags.contains(.shift)
+        case "ControlLeft", "ControlRight":
+            isDown = flags.contains(.control)
+        case "AltLeft", "AltRight":
+            isDown = flags.contains(.option)
+        case "MetaLeft", "MetaRight":
+            isDown = flags.contains(.command)
+            if isDown {
+                pendingCommandKeyCode = keyCode
+                activeCommandKeyCode = nil
+                commandKeySentToRemote = false
+                return
+            }
+
+            if commandKeySentToRemote {
+                let keyEvent = KeyEvent(
+                    keyCode: activeCommandKeyCode ?? keyCode,
+                    isKeyDown: false,
+                    modifiers: flags,
+                    timestamp: event.timestamp
+                )
+                sendKeyEvent(keyEvent)
+            }
+
+            clearPendingCommandKey()
+            return
+        case "CapsLock":
+            isDown = flags.contains(.capsLock)
+        default:
+            return
+        }
+
+        let keyEvent = KeyEvent(
+            keyCode: keyCode,
+            isKeyDown: isDown,
+            modifiers: flags,
+            timestamp: event.timestamp
+        )
+        sendKeyEvent(keyEvent)
+    }
+
+    private enum LocalKeyAction {
+        case passthrough
+        case pasteClipboard
+        case startSnippet
+    }
+
+    private func localActionFor(keyCode: UInt16,
+                                modifiers: NSEvent.ModifierFlags) -> LocalKeyAction? {
+        let tabKeyCode: UInt16 = 48
+        let cKeyCode: UInt16 = 8
+        let vKeyCode: UInt16 = 9
+
+        let cmd = modifiers.contains(.command)
+        let shift = modifiers.contains(.shift)
+        let option = modifiers.contains(.option)
+        let control = modifiers.contains(.control)
+
+        if keyCode == tabKeyCode, cmd, !shift, !control, !option {
+            return .passthrough
+        }
+
+        if keyCode == tabKeyCode, option, !cmd, !shift, !control {
+            return .passthrough
+        }
+
+        if cmd, shift {
+            if keyCode == vKeyCode {
+                return .pasteClipboard
+            }
+            if keyCode == cKeyCode {
+                return .startSnippet
+            }
+            return .passthrough
+        }
+
+        return nil
+    }
+
+    private func clearPendingCommandKey() {
+        pendingCommandKeyCode = nil
+        activeCommandKeyCode = nil
+        commandKeySentToRemote = false
+    }
+
+    private func releaseRemoteCommandForLocalShortcut() {
         if commandKeySentToRemote,
            transportMode == .glkvmWebSocket,
            let ws = glkvmWebSocketClient,
@@ -357,12 +433,6 @@ class InputManager: ObservableObject {
         }
 
         pendingCommandKeyCode = activeCommandKeyCode ?? pendingCommandKeyCode
-        activeCommandKeyCode = nil
-        commandKeySentToRemote = false
-    }
-
-    private func clearPendingCommandKey() {
-        pendingCommandKeyCode = nil
         activeCommandKeyCode = nil
         commandKeySentToRemote = false
     }
