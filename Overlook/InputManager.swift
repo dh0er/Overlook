@@ -23,8 +23,11 @@ class InputManager: ObservableObject {
     }
 
     private var pendingMouseMove: PendingAbsoluteMouseMove?
+    private var lastSentMouseMove: PendingAbsoluteMouseMove?
     private var mouseMoveSenderTask: Task<Void, Never>?
-    private static let mouseMoveSendIntervalNs: UInt64 = 8_333_333
+    private static let mouseMoveSendIntervalNs: UInt64 = 4_166_667
+
+    private var lastCursorDiagLogTime: CFTimeInterval = 0
 
     private var pendingCommandKeyCode: UInt16?
     private var activeCommandKeyCode: UInt16?
@@ -56,15 +59,29 @@ class InputManager: ObservableObject {
         }
     }
 
-    func handleVideoMouseMove(pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?) {
+    func handleVideoMouseMove(pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?, sourceContentRectInVideo: CGRect? = nil, videoViewLayerInfo: String? = nil) {
         guard isMouseCaptureEnabled else { return }
-        let normalized = normalizePointInViewToVideo(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize)
+        let normalized = normalizePointInViewToVideo(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize, sourceContentRectInVideo: sourceContentRectInVideo)
+        logCursorDiagnosticsIfDue(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize, sourceContentRectInVideo: sourceContentRectInVideo, normalized: normalized, layerInfo: videoViewLayerInfo)
         let moveEvent = MouseMoveEvent(position: normalized, timestamp: CACurrentMediaTime())
         if transportMode == .glkvmWebSocket {
             enqueueMouseMoveEvent(moveEvent)
         } else {
             sendMouseMoveEvent(moveEvent)
         }
+    }
+
+    private func logCursorDiagnosticsIfDue(pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?, sourceContentRectInVideo: CGRect?, normalized: CGPoint, layerInfo: String?) {
+        let now = CACurrentMediaTime()
+        guard now - lastCursorDiagLogTime >= 0.33 else { return }
+        lastCursorDiagLogTime = now
+        let (toX, toY) = glkvmAbsolutePoint(fromNormalized: normalized)
+        let videoStr = videoSize.map { "\(Int($0.width))x\(Int($0.height))" } ?? "nil"
+        let srcStr: String = sourceContentRectInVideo.map {
+            "(\(String(format: "%.3f", $0.minX)),\(String(format: "%.3f", $0.minY)),\(String(format: "%.3f", $0.width)),\(String(format: "%.3f", $0.height)))"
+        } ?? "full"
+        let layer = layerInfo ?? "n/a"
+        OverlookLog.info("cursor-diag view=\(Int(viewSize.width))x\(Int(viewSize.height)) video=\(videoStr) src=\(srcStr) point=(\(String(format: "%.1f", pointInView.x)),\(String(format: "%.1f", pointInView.y))) norm=(\(String(format: "%.4f", normalized.x)),\(String(format: "%.4f", normalized.y))) sent=(\(toX),\(toY)) layer=\(layer)")
     }
 
     private func enqueueMouseMoveEvent(_ event: MouseMoveEvent) {
@@ -99,6 +116,14 @@ class InputManager: ObservableObject {
                 }
 
                 if snapshot.mode == .glkvmWebSocket, let ws = snapshot.ws {
+                    let shouldSend = await MainActor.run {
+                        if self.lastSentMouseMove?.toX == move.toX, self.lastSentMouseMove?.toY == move.toY {
+                            return false
+                        }
+                        self.lastSentMouseMove = move
+                        return true
+                    }
+                    guard shouldSend else { continue }
                     try? await ws.sendHidMouseMove(toX: move.toX, toY: move.toY)
                 }
 
@@ -109,13 +134,14 @@ class InputManager: ObservableObject {
 
     private func stopMouseMoveSender() {
         pendingMouseMove = nil
+        lastSentMouseMove = nil
         mouseMoveSenderTask?.cancel()
         mouseMoveSenderTask = nil
     }
 
-    func handleVideoMouseButton(button: MouseButton, isDown: Bool, pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?) {
+    func handleVideoMouseButton(button: MouseButton, isDown: Bool, pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?, sourceContentRectInVideo: CGRect? = nil) {
         guard isMouseCaptureEnabled else { return }
-        let normalized = normalizePointInViewToVideo(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize)
+        let normalized = normalizePointInViewToVideo(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize, sourceContentRectInVideo: sourceContentRectInVideo)
         let buttonEvent = MouseButtonEvent(button: button, isDown: isDown, position: normalized, timestamp: CACurrentMediaTime())
         sendMouseButtonEvent(buttonEvent)
     }
@@ -391,11 +417,12 @@ class InputManager: ObservableObject {
         }
     }
     
-    func sendClick(at location: CGPoint, in geometry: GeometryProxy, videoSize: CGSize? = nil) {
+    func sendClick(at location: CGPoint, in geometry: GeometryProxy, videoSize: CGSize? = nil, sourceContentRectInVideo: CGRect? = nil) {
         let normalizedPosition = normalizePointInViewToVideo(
             pointInView: location,
             viewSize: geometry.size,
-            videoSize: videoSize
+            videoSize: videoSize,
+            sourceContentRectInVideo: sourceContentRectInVideo
         )
         
         let clickEvent = MouseButtonEvent(
@@ -648,7 +675,7 @@ class InputManager: ObservableObject {
         return (Int(signedX.rounded()), Int(signedY.rounded()))
     }
 
-    func normalizePointInViewToVideo(pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?) -> CGPoint {
+    func normalizePointInViewToVideo(pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?, sourceContentRectInVideo: CGRect? = nil) -> CGPoint {
         guard viewSize.width > 0, viewSize.height > 0 else {
             return .zero
         }
@@ -662,16 +689,30 @@ class InputManager: ObservableObject {
         let viewAspect = viewSize.width / viewSize.height
         let videoAspect = videoSize.width / videoSize.height
 
-        var contentRect = CGRect(origin: .zero, size: viewSize)
-
+        var videoRectInView = CGRect(origin: .zero, size: viewSize)
         if viewAspect > videoAspect {
             let contentWidth = viewSize.height * videoAspect
             let xOffset = (viewSize.width - contentWidth) / 2.0
-            contentRect = CGRect(x: xOffset, y: 0, width: contentWidth, height: viewSize.height)
+            videoRectInView = CGRect(x: xOffset, y: 0, width: contentWidth, height: viewSize.height)
         } else {
             let contentHeight = viewSize.width / videoAspect
             let yOffset = (viewSize.height - contentHeight) / 2.0
-            contentRect = CGRect(x: 0, y: yOffset, width: viewSize.width, height: contentHeight)
+            videoRectInView = CGRect(x: 0, y: yOffset, width: viewSize.width, height: contentHeight)
+        }
+
+        let contentRect: CGRect
+        if let src = sourceContentRectInVideo,
+           src.width > 0, src.height > 0,
+           src.minX >= 0, src.minY >= 0,
+           src.maxX <= 1.0001, src.maxY <= 1.0001 {
+            contentRect = CGRect(
+                x: videoRectInView.minX + src.minX * videoRectInView.width,
+                y: videoRectInView.minY + src.minY * videoRectInView.height,
+                width: src.width * videoRectInView.width,
+                height: src.height * videoRectInView.height
+            )
+        } else {
+            contentRect = videoRectInView
         }
 
         let clampedX = max(contentRect.minX, min(contentRect.maxX, pointInView.x))

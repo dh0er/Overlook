@@ -1,5 +1,106 @@
 import Foundation
 
+enum OverlookLog {
+    static let fileURL: URL = {
+        let directory = FileManager.default
+            .urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs/Overlook", isDirectory: true)
+        return directory.appendingPathComponent("overlook.log")
+    }()
+
+    private static let queue = DispatchQueue(label: "com.overlook.file-log")
+    private static let timestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    static func info(_ message: @autoclosure @escaping () -> String, file: StaticString = #fileID, line: UInt = #line) {
+        write(level: "INFO", message: message(), file: file, line: line)
+    }
+
+    static func error(_ message: @autoclosure @escaping () -> String, file: StaticString = #fileID, line: UInt = #line) {
+        write(level: "ERROR", message: message(), file: file, line: line)
+    }
+
+    static func describe(_ error: Error) -> String {
+        let nsError = error as NSError
+        var parts = [
+            "\(type(of: error))",
+            "domain=\(nsError.domain)",
+            "code=\(nsError.code)",
+            "description=\(nsError.localizedDescription)"
+        ]
+
+        if let failingURL = nsError.userInfo[NSURLErrorFailingURLErrorKey] as? URL {
+            parts.append("failingURL=\(redactedURL(failingURL))")
+        } else if let failingURLString = nsError.userInfo[NSURLErrorFailingURLStringErrorKey] as? String {
+            parts.append("failingURL=\(failingURLString)")
+        }
+
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            parts.append("underlyingDomain=\(underlying.domain)")
+            parts.append("underlyingCode=\(underlying.code)")
+            parts.append("underlyingDescription=\(underlying.localizedDescription)")
+        }
+
+        let keys = nsError.userInfo.keys
+            .map { String(describing: $0) }
+            .sorted()
+            .joined(separator: ",")
+        if !keys.isEmpty {
+            parts.append("userInfoKeys=\(keys)")
+        }
+
+        return parts.joined(separator: " ")
+    }
+
+    static func redactedURL(_ url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url.absoluteString
+        }
+        if components.queryItems?.isEmpty == false {
+            components.queryItems = components.queryItems?.map { URLQueryItem(name: $0.name, value: "<redacted>") }
+        }
+        return components.url?.absoluteString ?? url.absoluteString
+    }
+
+    private static func write(level: String, message: String, file: StaticString, line: UInt) {
+        let fileName = String(describing: file).split(separator: "/").last.map(String.init) ?? String(describing: file)
+        let entry = "\(timestampFormatter.string(from: Date())) [\(level)] [\(fileName):\(line)] \(message)\n"
+
+        queue.async {
+            do {
+                let directory = fileURL.deletingLastPathComponent()
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                rotateIfNeeded()
+
+                guard let data = entry.data(using: .utf8) else { return }
+                if FileManager.default.fileExists(atPath: fileURL.path) {
+                    let handle = try FileHandle(forWritingTo: fileURL)
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                    try handle.close()
+                } else {
+                    try data.write(to: fileURL, options: .atomic)
+                }
+            } catch {
+                NSLog("[Overlook log] failed to write log: %@", "\(error)")
+            }
+        }
+    }
+
+    private static func rotateIfNeeded() {
+        let maxBytes: UInt64 = 5 * 1024 * 1024
+        guard let size = try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? UInt64,
+              size > maxBytes else { return }
+
+        let rotated = fileURL.deletingLastPathComponent().appendingPathComponent("overlook.previous.log")
+        try? FileManager.default.removeItem(at: rotated)
+        try? FileManager.default.moveItem(at: fileURL, to: rotated)
+    }
+}
+
 typealias GLKVMJSONObject = [String: JSONValue]
 
 struct GLKVMResponse<Result: Decodable>: Decodable {
@@ -67,6 +168,28 @@ struct GLKVMSystemConfig: Codable, Hashable {
         case isAbsoluteMouse = "is_absolute_mouse"
         case fingerbotStrength = "fingerbot_strength"
         case videoProcessing = "video_processing"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        shortcuts = (try? c.decode([GLKVMSystemConfigShortcut].self, forKey: .shortcuts)) ?? []
+        orientation = (try? c.decode(Int.self, forKey: .orientation)) ?? 0
+        streamQuality = (try? c.decode(Int.self, forKey: .streamQuality)) ?? 80
+        videoMode = (try? c.decode(String.self, forKey: .videoMode)) ?? ""
+        showCursor = (try? c.decode(Bool.self, forKey: .showCursor)) ?? true
+        mousePolling = (try? c.decode(Int.self, forKey: .mousePolling)) ?? 10
+        mouseControl = (try? c.decode(Bool.self, forKey: .mouseControl)) ?? true
+        relativeSense = (try? c.decode(Int.self, forKey: .relativeSense)) ?? 10
+        scrollRate = (try? c.decode(Int.self, forKey: .scrollRate)) ?? 1
+        reverseScrolling = (try? c.decode(String.self, forKey: .reverseScrolling)) ?? "STANDARD"
+        keyboardControl = (try? c.decode(Bool.self, forKey: .keyboardControl)) ?? true
+        themeMode = (try? c.decode(String.self, forKey: .themeMode)) ?? "auto"
+        mouseJiggle = (try? c.decode(Bool.self, forKey: .mouseJiggle)) ?? false
+        keymap = (try? c.decode(String.self, forKey: .keymap)) ?? "en-us"
+        gotMutedPanelTip = (try? c.decode(Bool.self, forKey: .gotMutedPanelTip)) ?? false
+        isAbsoluteMouse = (try? c.decode(Bool.self, forKey: .isAbsoluteMouse)) ?? true
+        fingerbotStrength = (try? c.decode(Int.self, forKey: .fingerbotStrength)) ?? 0
+        videoProcessing = (try? c.decode(String.self, forKey: .videoProcessing)) ?? ""
     }
 }
 
@@ -234,7 +357,8 @@ final class GLKVMClient {
     private let session: URLSession
 
     init(host: String, port: Int = 443, authToken: String? = nil, allowInsecureTLS: Bool = true) throws {
-        guard let url = URL(string: "https://\(host):\(port)") else {
+        let scheme = (port == 80 || port == 8080) ? "http" : "https"
+        guard let url = URL(string: "\(scheme)://\(host):\(port)") else {
             throw ClientError.invalidBaseURL
         }
 
@@ -242,14 +366,29 @@ final class GLKVMClient {
         self.authToken = authToken
 
         let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = false
+        config.allowsConstrainedNetworkAccess = true
+        config.allowsExpensiveNetworkAccess = true
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.httpMaximumConnectionsPerHost = 1
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
 
+        OverlookLog.info("GLKVMClient init baseURL=\(url.absoluteString) allowInsecureTLS=\(allowInsecureTLS) timeoutRequest=\(config.timeoutIntervalForRequest) timeoutResource=\(config.timeoutIntervalForResource)")
         self.session = URLSession(configuration: config, delegate: SessionDelegate(allowInsecureTLS: allowInsecureTLS), delegateQueue: nil)
     }
 
     convenience init(device: KVMDevice, allowInsecureTLS: Bool = true) throws {
         try self.init(host: device.host, port: device.port, authToken: device.authToken.isEmpty ? nil : device.authToken, allowInsecureTLS: allowInsecureTLS)
+    }
+
+    private static func elapsedMilliseconds(since date: Date) -> Int {
+        Int(Date().timeIntervalSince(date) * 1000)
+    }
+
+    private static func preview(_ data: Data, limit: Int = 512) -> String {
+        String(data: data.prefix(limit), encoding: .utf8) ?? "<binary \(data.count)B>"
     }
 
     private func makeURL(path: String, queryItems: [URLQueryItem] = []) throws -> URL {
@@ -281,6 +420,7 @@ final class GLKVMClient {
         let url = try makeURL(path: path, queryItems: query)
 
         var request = URLRequest(url: url)
+        request.assumesHTTP3Capable = false
         request.httpMethod = method
         request.httpBody = body
 
@@ -292,10 +432,22 @@ final class GLKVMClient {
             request.setValue("auth_token=\(authToken)", forHTTPHeaderField: "Cookie")
         }
 
-        let (data, response) = try await session.data(for: request)
+        OverlookLog.info("HTTP request start method=\(method) url=\(OverlookLog.redactedURL(url)) bodyBytes=\(body?.count ?? 0) hasAuthCookie=\((self.authToken?.isEmpty == false)) assumesHTTP3=\(request.assumesHTTP3Capable)")
+        let startedAt = Date()
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            OverlookLog.error("HTTP request error method=\(method) url=\(OverlookLog.redactedURL(url)) durationMs=\(Self.elapsedMilliseconds(since: startedAt)) error=\(OverlookLog.describe(error))")
+            throw error
+        }
         guard let http = response as? HTTPURLResponse else {
+            OverlookLog.error("HTTP response was not HTTPURLResponse method=\(method) url=\(OverlookLog.redactedURL(url)) response=\(String(describing: response))")
             throw ClientError.decodingFailed
         }
+
+        OverlookLog.info("HTTP response method=\(method) url=\(OverlookLog.redactedURL(url)) status=\(http.statusCode) bytes=\(data.count) durationMs=\(Self.elapsedMilliseconds(since: startedAt))")
 
         guard (200...299).contains(http.statusCode) else {
             let bodyString = String(data: data, encoding: .utf8)
@@ -307,6 +459,7 @@ final class GLKVMClient {
                     errorMessage = s
                 }
             }
+            OverlookLog.error("HTTP non-2xx method=\(method) url=\(OverlookLog.redactedURL(url)) status=\(http.statusCode) body=\(Self.preview(data))")
             throw ClientError.httpError(statusCode: http.statusCode, body: errorMessage ?? bodyString)
         }
 
@@ -314,6 +467,9 @@ final class GLKVMClient {
         do {
             return try decoder.decode(Response.self, from: data)
         } catch {
+            let preview = String(data: data.prefix(512), encoding: .utf8) ?? "<binary \(data.count)B>"
+            OverlookLog.error("HTTP decode failed method=\(method) url=\(OverlookLog.redactedURL(url)) status=\(http.statusCode) error=\(OverlookLog.describe(error)) body=\(preview)")
+            NSLog("[Overlook glkvm] decode failed for %@ (status=%d): %@ | body: %@", url.absoluteString, http.statusCode, "\(error)", preview)
             throw ClientError.decodingFailed
         }
     }
@@ -348,15 +504,51 @@ final class GLKVMClient {
         body.append("\(password)\r\n".data(using: .utf8) ?? Data())
         body.append("--\(boundary)--\r\n".data(using: .utf8) ?? Data())
 
-        let response = try await request(
-            method: "POST",
-            path: "api/auth/login",
-            body: body,
-            contentType: "multipart/form-data; boundary=\(boundary)",
-            responseType: GLKVMResponse<GLKVMAuthLoginResult>.self
-        )
+        // Some firmware returns the token in the JSON body (`result.token`),
+        // others return an empty result and set the token via Set-Cookie.
+        // Try the body first, fall back to the cookie.
+        let url = try makeURL(path: "api/auth/login")
+        var request = URLRequest(url: url)
+        request.assumesHTTP3Capable = false
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-        return response.result.token
+        OverlookLog.info("HTTP request start method=POST url=\(OverlookLog.redactedURL(url)) bodyBytes=\(body.count) hasAuthCookie=false assumesHTTP3=\(request.assumesHTTP3Capable) purpose=authLogin")
+        let startedAt = Date()
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            OverlookLog.error("HTTP request error method=POST url=\(OverlookLog.redactedURL(url)) durationMs=\(Self.elapsedMilliseconds(since: startedAt)) purpose=authLogin error=\(OverlookLog.describe(error))")
+            throw error
+        }
+        guard let http = response as? HTTPURLResponse else {
+            OverlookLog.error("HTTP response was not HTTPURLResponse method=POST url=\(OverlookLog.redactedURL(url)) purpose=authLogin response=\(String(describing: response))")
+            throw ClientError.decodingFailed
+        }
+        OverlookLog.info("HTTP response method=POST url=\(OverlookLog.redactedURL(url)) status=\(http.statusCode) bytes=\(data.count) durationMs=\(Self.elapsedMilliseconds(since: startedAt)) purpose=authLogin")
+        guard (200...299).contains(http.statusCode) else {
+            let bodyString = String(data: data, encoding: .utf8)
+            OverlookLog.error("HTTP non-2xx method=POST url=\(OverlookLog.redactedURL(url)) status=\(http.statusCode) purpose=authLogin body=\(Self.preview(data))")
+            throw ClientError.httpError(statusCode: http.statusCode, body: bodyString)
+        }
+
+        if let wrapped = try? JSONDecoder().decode(GLKVMResponse<GLKVMAuthLoginResult>.self, from: data) {
+            return wrapped.result.token
+        }
+
+        let headers = http.allHeaderFields as? [String: String] ?? [:]
+        let cookies = HTTPCookie.cookies(withResponseHeaderFields: headers, for: url)
+        if let token = cookies.first(where: { $0.name == "auth_token" })?.value {
+            return token
+        }
+
+        let preview = String(data: data.prefix(512), encoding: .utf8) ?? "<binary \(data.count)B>"
+        OverlookLog.error("authLogin succeeded but token missing body=\(preview)")
+        NSLog("[Overlook glkvm] login succeeded but no token found. body: %@", preview)
+        throw ClientError.decodingFailed
     }
 
     func getSystemConfig() async throws -> GLKVMSystemConfig {
@@ -431,7 +623,7 @@ final class GLKVMClient {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             throw ClientError.invalidURL
         }
-        components.scheme = "wss"
+        components.scheme = (baseURL.scheme == "https") ? "wss" : "ws"
         components.path = "/api/ws"
         guard let url = components.url else {
             throw ClientError.invalidURL
@@ -443,7 +635,7 @@ final class GLKVMClient {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             throw ClientError.invalidURL
         }
-        components.scheme = "wss"
+        components.scheme = (baseURL.scheme == "https") ? "wss" : "ws"
         components.path = "/api/media/ws"
         guard let url = components.url else {
             throw ClientError.invalidURL
@@ -481,6 +673,7 @@ extension GLKVMClient {
         let url = try makeURL(path: path, queryItems: query)
 
         var request = URLRequest(url: url)
+        request.assumesHTTP3Capable = false
         request.httpMethod = method
         request.httpBody = body
 
@@ -492,10 +685,22 @@ extension GLKVMClient {
             request.setValue("auth_token=\(authToken)", forHTTPHeaderField: "Cookie")
         }
 
-        let (data, response) = try await session.data(for: request)
+        OverlookLog.info("HTTP data request start method=\(method) url=\(OverlookLog.redactedURL(url)) bodyBytes=\(body?.count ?? 0) hasAuthCookie=\((self.authToken?.isEmpty == false)) assumesHTTP3=\(request.assumesHTTP3Capable)")
+        let startedAt = Date()
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            OverlookLog.error("HTTP data request error method=\(method) url=\(OverlookLog.redactedURL(url)) durationMs=\(Self.elapsedMilliseconds(since: startedAt)) error=\(OverlookLog.describe(error))")
+            throw error
+        }
         guard let http = response as? HTTPURLResponse else {
+            OverlookLog.error("HTTP data response was not HTTPURLResponse method=\(method) url=\(OverlookLog.redactedURL(url)) response=\(String(describing: response))")
             throw ClientError.decodingFailed
         }
+
+        OverlookLog.info("HTTP data response method=\(method) url=\(OverlookLog.redactedURL(url)) status=\(http.statusCode) bytes=\(data.count) durationMs=\(Self.elapsedMilliseconds(since: startedAt))")
 
         guard (200...299).contains(http.statusCode) else {
             let bodyString = String(data: data, encoding: .utf8)
@@ -507,6 +712,7 @@ extension GLKVMClient {
                     errorMessage = s
                 }
             }
+            OverlookLog.error("HTTP data non-2xx method=\(method) url=\(OverlookLog.redactedURL(url)) status=\(http.statusCode) body=\(Self.preview(data))")
             throw ClientError.httpError(statusCode: http.statusCode, body: errorMessage ?? bodyString)
         }
 

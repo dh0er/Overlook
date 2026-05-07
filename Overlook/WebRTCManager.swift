@@ -72,6 +72,7 @@ class WebRTCManager: NSObject, ObservableObject {
     @Published var latency: Int = 0
     @Published var currentFrame: CVPixelBuffer?
     @Published var videoSize: CGSize?
+    @Published var sourceContentRectInVideo: CGRect?
     @Published var inboundVideoKbps: Int?
     @Published var inboundFps: Double?
     @Published var inboundVideoPlayoutDelayMs: Int?
@@ -144,6 +145,8 @@ class WebRTCManager: NSObject, ObservableObject {
     private let allowInsecureTLS = true
     private var signalingSession: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
+    private var signalingListenTask: Task<Void, Never>?
+    private var signalingGeneration: Int = 0
 
     private var janusSessionId: Int?
     private var janusHandleId: Int?
@@ -153,6 +156,10 @@ class WebRTCManager: NSObject, ObservableObject {
 
     private var isFrameCaptureEnabled: Bool = false
     private var lastFrameCaptureTime: CFTimeInterval = 0
+
+    private let letterboxDetector = LetterboxDetector()
+    private var letterboxDetectionTask: Task<Void, Never>?
+    private static let letterboxDetectionIntervalSeconds: UInt64 = 2_000_000_000
     
     override init() {
         super.init()
@@ -445,15 +452,19 @@ class WebRTCManager: NSObject, ObservableObject {
         if !device.authToken.isEmpty {
             request.setValue("auth_token=\(device.authToken)", forHTTPHeaderField: "Cookie")
         }
-        request.setValue("https://\(device.host):\(device.port)", forHTTPHeaderField: "Origin")
+        let originScheme = (device.port == 80 || device.port == 8080) ? "http" : "https"
+        request.setValue("\(originScheme)://\(device.host):\(device.port)", forHTTPHeaderField: "Origin")
         request.setValue("janus-protocol", forHTTPHeaderField: "Sec-WebSocket-Protocol")
 
         webSocketTask = session.webSocketTask(with: request)
         
         webSocketTask?.resume()
 
-        Task {
-            await listenForSignalingMessages()
+        signalingGeneration += 1
+        let generation = signalingGeneration
+        signalingListenTask?.cancel()
+        signalingListenTask = Task { [weak self] in
+            await self?.listenForSignalingMessages(generation: generation)
         }
 
         // Janus session setup
@@ -636,12 +647,14 @@ class WebRTCManager: NSObject, ObservableObject {
         return comps.url ?? url
     }
     
-    private func listenForSignalingMessages() async {
-        while let webSocketTask = webSocketTask {
+    private func listenForSignalingMessages(generation: Int) async {
+        while !Task.isCancelled, generation == signalingGeneration, let webSocketTask = webSocketTask {
             do {
                 let message = try await webSocketTask.receive()
+                guard generation == signalingGeneration else { break }
                 await handleSignalingMessage(message)
             } catch {
+                guard generation == signalingGeneration, !Task.isCancelled else { break }
                 print("WebSocket receive error: \(error)")
                 isConnecting = false
                 if isConnected || hasEverConnectedToStream || lastDisconnectReason == nil {
@@ -1183,6 +1196,8 @@ class WebRTCManager: NSObject, ObservableObject {
     }
     
     func disconnect() {
+        signalingGeneration += 1
+
         connectionTimer?.invalidate()
         connectionTimer = nil
 
@@ -1200,11 +1215,25 @@ class WebRTCManager: NSObject, ObservableObject {
             waiter.resume(throwing: WebRTCError.signalingConnectionLost)
         }
         
+        signalingListenTask?.cancel()
+        signalingListenTask = nil
+
         webSocketTask?.cancel()
         webSocketTask = nil
+
+        signalingSession?.invalidateAndCancel()
+        signalingSession = nil
         
         dataChannel?.close()
         dataChannel = nil
+
+        if let videoTrack {
+            if let videoView {
+                videoTrack.remove(videoView)
+            }
+            videoTrack.remove(self)
+        }
+        videoTrack = nil
         
         peerConnection?.close()
         peerConnection = nil
@@ -1226,6 +1255,8 @@ class WebRTCManager: NSObject, ObservableObject {
         connectedIceTime = nil
         latency = 0
         videoSize = nil
+        sourceContentRectInVideo = nil
+        stopLetterboxDetectionTask()
         isFrameCaptureEnabled = false
         inboundVideoKbps = nil
         inboundFps = nil
@@ -1321,7 +1352,9 @@ extension WebRTCManager: @preconcurrency RTCPeerConnectionDelegate {
                 hasEverConnectedToStream = true
                 connectedIceTime = CACurrentMediaTime()
                 lastDisconnectReason = nil
+                startLetterboxDetectionTask()
             } else {
+                stopLetterboxDetectionTask()
                 if stateChanged == .disconnected {
                     lastDisconnectReason = "Video connection lost"
                     isConnecting = false
@@ -1464,8 +1497,6 @@ extension WebRTCManager: @preconcurrency RTCVideoRenderer {
             lastFpsPublishTime = now
         }
 
-        guard isFrameCaptureEnabled else { return }
-
         let minInterval: CFTimeInterval = 1.0 / 12.0
         if now - lastFrameCaptureTime < minInterval {
             return
@@ -1486,6 +1517,42 @@ extension WebRTCManager: @preconcurrency RTCVideoRenderer {
                 videoSize = size
             }
         }
+    }
+
+    private func startLetterboxDetectionTask() {
+        guard letterboxDetectionTask == nil else { return }
+        letterboxDetector.reset()
+        let intervalNs = Self.letterboxDetectionIntervalSeconds
+        let initialDelayNs: UInt64 = 800_000_000
+        letterboxDetectionTask = Task.detached(priority: .utility) { [weak self] in
+            try? await Task.sleep(nanoseconds: initialDelayNs)
+            while !Task.isCancelled {
+                guard let self else { return }
+                let frame = await MainActor.run { self.currentFrame }
+                if let frame, let detected = self.letterboxDetector.sample(frame) {
+                    let unit = CGRect(x: 0, y: 0, width: 1, height: 1)
+                    let isFullFrame = abs(detected.minX) < 0.005 && abs(detected.minY) < 0.005 &&
+                                       abs(detected.maxX - 1) < 0.005 && abs(detected.maxY - 1) < 0.005
+                    let resolved: CGRect? = isFullFrame ? nil : detected.intersection(unit)
+                    await MainActor.run {
+                        if self.sourceContentRectInVideo != resolved {
+                            self.sourceContentRectInVideo = resolved
+                            if let r = resolved {
+                                OverlookLog.info("letterbox-detect contentRectInVideo=(\(String(format: "%.4f", r.minX)),\(String(format: "%.4f", r.minY)),\(String(format: "%.4f", r.width)),\(String(format: "%.4f", r.height)))")
+                            } else {
+                                OverlookLog.info("letterbox-detect contentRectInVideo=full")
+                            }
+                        }
+                    }
+                }
+                try? await Task.sleep(nanoseconds: intervalNs)
+            }
+        }
+    }
+
+    private func stopLetterboxDetectionTask() {
+        letterboxDetectionTask?.cancel()
+        letterboxDetectionTask = nil
     }
 }
 

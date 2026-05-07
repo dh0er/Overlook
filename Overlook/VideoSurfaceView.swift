@@ -22,6 +22,9 @@ struct VideoSurfaceView: View {
     @State private var ocrDragCurrent: CGPoint?
     @State private var ocrRegionsTask: Task<Void, Never>?
 
+    @State private var isHoveringStream = false
+    @AppStorage(TrackingContainerView.hideSystemCursorDefaultsKey) private var hideSystemCursorOverStream: Bool = false
+
     private var ocrSelectionRect: CGRect? {
         guard let start = ocrDragStart, let current = ocrDragCurrent else { return nil }
         let x = min(start.x, current.x)
@@ -45,7 +48,18 @@ struct VideoSurfaceView: View {
                             inputManager.handleVideoMouseMove(
                                 pointInView: pointInView,
                                 viewSize: geometry.size,
-                                videoSize: currentVideoSize()
+                                videoSize: currentVideoSize(),
+                                sourceContentRectInVideo: webRTCManager.sourceContentRectInVideo
+                            )
+                        },
+                        onMouseMoveWithLayerInfo: { pointInView, layerInfo in
+                            guard !isOCRModeEnabled else { return }
+                            inputManager.handleVideoMouseMove(
+                                pointInView: pointInView,
+                                viewSize: geometry.size,
+                                videoSize: currentVideoSize(),
+                                sourceContentRectInVideo: webRTCManager.sourceContentRectInVideo,
+                                videoViewLayerInfo: layerInfo
                             )
                         },
                         onMouseButton: { button, isDown, pointInView in
@@ -55,7 +69,8 @@ struct VideoSurfaceView: View {
                                 isDown: isDown,
                                 pointInView: pointInView,
                                 viewSize: geometry.size,
-                                videoSize: currentVideoSize()
+                                videoSize: currentVideoSize(),
+                                sourceContentRectInVideo: webRTCManager.sourceContentRectInVideo
                             )
                         },
                         onScrollWheel: { deltaX, deltaY in
@@ -112,7 +127,7 @@ struct VideoSurfaceView: View {
                         )
                 }
 
-                if webRTCManager.isConnecting || webRTCManager.isStreamStalled || (webRTCManager.hasEverConnectedToStream && !webRTCManager.isConnected) {
+                if isShowingStatusOverlay {
                     VStack(spacing: 10) {
                         Text(webRTCManager.isConnecting ? "Connecting…" : "Connection Lost")
                             .font(.headline)
@@ -142,6 +157,23 @@ struct VideoSurfaceView: View {
                     .padding()
                 }
             }
+            .contentShape(Rectangle())
+            .onContinuousHover(coordinateSpace: .local) { phase in
+                switch phase {
+                case .active(let location):
+                    let rect = videoContentRect(viewSize: geometry.size)
+                    let isInsideStream = rect.contains(location)
+                    if isHoveringStream != isInsideStream {
+                        isHoveringStream = isInsideStream
+                        StreamCursorHider.shared.update(shouldHide: shouldHideCursor)
+                    }
+                case .ended:
+                    if isHoveringStream {
+                        isHoveringStream = false
+                        StreamCursorHider.shared.update(shouldHide: shouldHideCursor)
+                    }
+                }
+            }
         }
         .onChange(of: isOCRModeEnabled) { _, enabled in
             setOCRMode(enabled)
@@ -152,6 +184,43 @@ struct VideoSurfaceView: View {
         .onDisappear {
             ocrRegionsTask?.cancel()
             ocrRegionsTask = nil
+            isHoveringStream = false
+            StreamCursorHider.shared.update(shouldHide: false)
+        }
+        .onChange(of: hideSystemCursorOverStream) { _, _ in
+            StreamCursorHider.shared.update(shouldHide: shouldHideCursor)
+        }
+        .onChange(of: isShowingStatusOverlay) { _, _ in
+            StreamCursorHider.shared.update(shouldHide: shouldHideCursor)
+        }
+    }
+
+    private var isShowingStatusOverlay: Bool {
+        webRTCManager.isConnecting
+            || webRTCManager.isStreamStalled
+            || (webRTCManager.hasEverConnectedToStream && !webRTCManager.isConnected)
+    }
+
+    private var shouldHideCursor: Bool {
+        isHoveringStream && hideSystemCursorOverStream && !isShowingStatusOverlay
+    }
+
+    private func videoContentRect(viewSize: CGSize) -> CGRect {
+        guard viewSize.width > 0, viewSize.height > 0,
+              let videoSize = currentVideoSize(),
+              videoSize.width > 0, videoSize.height > 0 else {
+            return CGRect(origin: .zero, size: viewSize)
+        }
+        let viewAspect = viewSize.width / viewSize.height
+        let videoAspect = videoSize.width / videoSize.height
+        if viewAspect > videoAspect {
+            let contentWidth = viewSize.height * videoAspect
+            let xOffset = (viewSize.width - contentWidth) / 2.0
+            return CGRect(x: xOffset, y: 0, width: contentWidth, height: viewSize.height)
+        } else {
+            let contentHeight = viewSize.width / videoAspect
+            let yOffset = (viewSize.height - contentHeight) / 2.0
+            return CGRect(x: 0, y: yOffset, width: viewSize.width, height: contentHeight)
         }
     }
 
@@ -256,12 +325,14 @@ struct VideoSurfaceView: View {
 struct VideoViewRepresentable: NSViewRepresentable {
     let videoView: RTCMTLNSVideoView
     let onMouseMove: (CGPoint) -> Void
+    let onMouseMoveWithLayerInfo: ((CGPoint, String) -> Void)?
     let onMouseButton: (MouseButton, Bool, CGPoint) -> Void
     let onScrollWheel: (CGFloat, CGFloat) -> Void
 
     func makeNSView(context: Context) -> TrackingContainerView {
         let container = TrackingContainerView()
         container.onMouseMove = onMouseMove
+        container.onMouseMoveWithLayerInfo = onMouseMoveWithLayerInfo
         container.onMouseButton = onMouseButton
         container.onScrollWheel = onScrollWheel
         container.embedVideoViewIfNeeded(videoView)
@@ -270,6 +341,7 @@ struct VideoViewRepresentable: NSViewRepresentable {
 
     func updateNSView(_ nsView: TrackingContainerView, context: Context) {
         nsView.onMouseMove = onMouseMove
+        nsView.onMouseMoveWithLayerInfo = onMouseMoveWithLayerInfo
         nsView.onMouseButton = onMouseButton
         nsView.onScrollWheel = onScrollWheel
         nsView.embedVideoViewIfNeeded(videoView)
@@ -278,11 +350,13 @@ struct VideoViewRepresentable: NSViewRepresentable {
 
 final class TrackingContainerView: NSView {
     var onMouseMove: ((CGPoint) -> Void)?
+    var onMouseMoveWithLayerInfo: ((CGPoint, String) -> Void)?
     var onMouseButton: ((MouseButton, Bool, CGPoint) -> Void)?
     var onScrollWheel: ((CGFloat, CGFloat) -> Void)?
 
+    static let hideSystemCursorDefaultsKey = "overlook.hideSystemCursorOverStream"
+
     private var trackingAreaRef: NSTrackingArea?
-    private var lastMoveTimestamp: TimeInterval = 0
 
     private weak var embeddedVideoView: RTCMTLNSVideoView?
     private var embeddedConstraints: [NSLayoutConstraint] = []
@@ -350,16 +424,31 @@ final class TrackingContainerView: NSView {
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
 
-        let minInterval = 1.0 / 120.0
-        let ts = event.timestamp
-        if ts - lastMoveTimestamp < minInterval {
-            return
-        }
-        lastMoveTimestamp = ts
-
         let p = convert(event.locationInWindow, from: nil)
         let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
-        onMouseMove?(flipped)
+        if let cb = onMouseMoveWithLayerInfo {
+            cb(flipped, describeVideoViewGeometry())
+        } else {
+            onMouseMove?(flipped)
+        }
+    }
+
+    private func describeVideoViewGeometry() -> String {
+        guard let videoView = embeddedVideoView else { return "noVideoView" }
+        let vb = videoView.bounds
+        var parts = ["videoBounds=\(Int(vb.width))x\(Int(vb.height))@(\(Int(vb.minX)),\(Int(vb.minY)))"]
+        if let layer = videoView.layer {
+            parts.append("layerFrame=\(Int(layer.frame.width))x\(Int(layer.frame.height))@(\(Int(layer.frame.minX)),\(Int(layer.frame.minY)))")
+            parts.append("contentsGravity=\(layer.contentsGravity.rawValue)")
+            for (i, sub) in (layer.sublayers ?? []).enumerated() {
+                parts.append("subLayer[\(i)]=\(type(of: sub))/\(Int(sub.frame.width))x\(Int(sub.frame.height))@(\(Int(sub.frame.minX)),\(Int(sub.frame.minY)))/g=\(sub.contentsGravity.rawValue)")
+            }
+        }
+        for (i, sub) in videoView.subviews.enumerated() {
+            let f = sub.frame
+            parts.append("subView[\(i)]=\(type(of: sub))/\(Int(f.width))x\(Int(f.height))@(\(Int(f.minX)),\(Int(f.minY)))")
+        }
+        return parts.joined(separator: " ")
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -426,3 +515,30 @@ final class TrackingContainerView: NSView {
     }
 }
 #endif
+
+@MainActor
+final class StreamCursorHider {
+    static let shared = StreamCursorHider()
+
+    private var hidden = false
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.update(shouldHide: false) }
+        }
+    }
+
+    func update(shouldHide: Bool) {
+        if shouldHide && !hidden {
+            NSCursor.hide()
+            hidden = true
+        } else if !shouldHide && hidden {
+            NSCursor.unhide()
+            hidden = false
+        }
+    }
+}

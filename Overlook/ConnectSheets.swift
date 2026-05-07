@@ -46,6 +46,10 @@ struct PasswordPromptSheet: View {
     let onCancel: () -> Void
     let onConnect: () -> Void
 
+    private var canSubmit: Bool {
+        !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Password Required")
@@ -53,6 +57,7 @@ struct PasswordPromptSheet: View {
 
             SecureField("Password", text: $password)
                 .textFieldStyle(.roundedBorder)
+                .onSubmit(submit)
 
             HStack {
                 Spacer()
@@ -61,13 +66,19 @@ struct PasswordPromptSheet: View {
                     isPresented = false
                 }
                 Button("Connect") {
-                    onConnect()
-                    isPresented = false
+                    submit()
                 }
-                .disabled(password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canSubmit)
             }
         }
         .padding()
         .frame(width: 420)
+    }
+
+    private func submit() {
+        guard canSubmit else { return }
+        onConnect()
+        isPresented = false
     }
 }
