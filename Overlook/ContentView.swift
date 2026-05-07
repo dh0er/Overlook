@@ -10,10 +10,7 @@ struct ContentView: View {
     
     @State private var selectedDevice: KVMDevice?
     @State private var isConnected = false
-    @State private var isOCRModeEnabled = false
-    @State private var isShowingOCRResult = false
     @State private var showingSettings = false
-    @State private var selectedText = ""
 
     @State private var showingManualConnect = false
     @State private var manualHostPort = ""
@@ -115,9 +112,6 @@ struct ContentView: View {
         ZStack(alignment: .trailing) {
             if isFullscreen {
                 VideoSurfaceView(
-                    isOCRModeEnabled: $isOCRModeEnabled,
-                    selectedText: $selectedText,
-                    isShowingOCRResult: $isShowingOCRResult,
                     onReconnect: {
                         reconnectCurrentSession()
                     }
@@ -126,9 +120,6 @@ struct ContentView: View {
                 .allowsHitTesting(!showingSettings)
             } else {
                 VideoSurfaceView(
-                    isOCRModeEnabled: $isOCRModeEnabled,
-                    selectedText: $selectedText,
-                    isShowingOCRResult: $isShowingOCRResult,
                     onReconnect: {
                         reconnectCurrentSession()
                     }
@@ -172,12 +163,6 @@ struct ContentView: View {
                             }
                             .disabled(webRTCManager.videoSize == nil)
                             .help("Fit window to guest")
-
-                            Button(action: { toggleOCR() }) {
-                                Image(systemName: isOCRModeEnabled ? "text.viewfinder" : "doc.text")
-                            }
-                            .disabled(!isConnected)
-                            .help(isOCRModeEnabled ? "Disable OCR Selection" : "Enable OCR Selection")
 
                             Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
                                 Image(systemName: "gearshape")
@@ -323,16 +308,8 @@ struct ContentView: View {
                 }
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .overlookToggleCopyMode)) { _ in
-            Task { @MainActor in
-                isOCRModeEnabled.toggle()
-            }
-        }
         .onChange(of: appAppearance) { _, _ in
             applyAppAppearance()
-        }
-        .sheet(isPresented: $isShowingOCRResult) {
-            OCRResultView(selectedText: $selectedText)
         }
         .sheet(isPresented: $showingManualConnect) {
             ManualConnectSheet(
@@ -376,12 +353,6 @@ struct ContentView: View {
                     }
                     .disabled(webRTCManager.videoSize == nil)
                     .help("Fit window to guest")
-
-                    Button(action: { toggleOCR() }) {
-                        Image(systemName: isOCRModeEnabled ? "text.viewfinder" : "doc.text")
-                    }
-                    .disabled(!isConnected)
-                    .help(isOCRModeEnabled ? "Disable OCR Selection" : "Enable OCR Selection")
 
                     Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
                         Image(systemName: "gearshape")
@@ -549,11 +520,6 @@ struct ContentView: View {
         return nil
     }
     
-    @MainActor
-    private func toggleOCR() {
-        isOCRModeEnabled.toggle()
-    }
-
     @MainActor
     private func fitWindowToGuest() {
         guard let videoSize = webRTCManager.videoSize,
