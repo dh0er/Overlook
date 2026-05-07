@@ -7,7 +7,6 @@ import Combine
 @MainActor
 class OCRManager: ObservableObject {
     @Published var isProcessing = false
-    @Published var lastRecognizedText = ""
 
     nonisolated(unsafe) private var textRecognitionRequest: VNRecognizeTextRequest?
     nonisolated(unsafe) private var ocrQueue = DispatchQueue(label: "com.overlook.ocr", qos: .userInitiated)
@@ -17,12 +16,7 @@ class OCRManager: ObservableObject {
     }
 
     private func setupOCRRequests() {
-        textRecognitionRequest = VNRecognizeTextRequest { [weak self] request, error in
-            Task { @MainActor in
-                self?.handleTextRecognition(request: request, error: error)
-            }
-        }
-
+        textRecognitionRequest = VNRecognizeTextRequest()
         textRecognitionRequest?.recognitionLevel = .accurate
         textRecognitionRequest?.usesLanguageCorrection = true
         textRecognitionRequest?.recognitionLanguages = ["en-US", "en-GB"]
@@ -69,6 +63,9 @@ class OCRManager: ObservableObject {
             try handler.perform([request])
 
             guard let observations = request.results else {
+                Task { @MainActor in
+                    isProcessing = false
+                }
                 completion(.failure(OCRError.noTextFound))
                 return
             }
@@ -78,7 +75,6 @@ class OCRManager: ObservableObject {
             }.joined(separator: " ")
 
             Task { @MainActor in
-                lastRecognizedText = recognizedText
                 isProcessing = false
             }
 
@@ -128,33 +124,6 @@ class OCRManager: ObservableObject {
 
         return outputBuffer
     }
-
-    private func handleTextRecognition(request: VNRequest, error: Error?) {
-        if let error = error {
-            print("Text recognition error: \(error)")
-            return
-        }
-
-        guard let request = request as? VNRecognizeTextRequest,
-              let observations = request.results else {
-            return
-        }
-
-        let recognizedText = observations.compactMap { observation in
-            observation.topCandidates(1).first?.string
-        }.joined(separator: "\n")
-
-        Task { @MainActor in
-            lastRecognizedText = recognizedText
-            isProcessing = false
-        }
-    }
-
-    func copyTextToClipboard(_ text: String) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-    }
 }
 
 private struct PixelBufferBox: @unchecked Sendable {
@@ -169,7 +138,6 @@ enum OCRError: Error, LocalizedError {
     case noVideoFrame
     case requestNotInitialized
     case noTextFound
-    case processingFailed
 
     var errorDescription: String? {
         switch self {
@@ -179,8 +147,6 @@ enum OCRError: Error, LocalizedError {
             return "OCR request not properly initialized"
         case .noTextFound:
             return "No text found in the specified region"
-        case .processingFailed:
-            return "OCR processing failed"
         }
     }
 }
