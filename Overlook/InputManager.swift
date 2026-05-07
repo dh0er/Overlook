@@ -5,8 +5,6 @@ import Combine
 import SwiftUI
 
 extension Notification.Name {
-    // TODO(task 6): remove once no caller/listener references it.
-    static let overlookToggleCopyMode = Notification.Name("overlook.toggleCopyMode")
     static let overlookStartSnippet = Notification.Name("overlook.startSnippet")
     static let overlookCancelSnippet = Notification.Name("overlook.cancelSnippet")
 }
