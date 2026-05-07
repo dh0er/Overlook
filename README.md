@@ -11,8 +11,8 @@ It focuses on *fast*, *low-friction* day-to-day “reach over and fix it” work
 - Low-latency WebRTC video streaming (Janus signaling).
 - Full keyboard + mouse input capture.
 - **Clipboard bridging**:
-  - **Local → Remote paste** with `⌘V` (types the clipboard into the remote machine).
-  - **Remote → Local copy via ML OCR**: select text directly from the live video stream using Apple Vision and copy it to your Mac clipboard.
+  - **Local → Remote paste** with `⌘⇧V` (types the Mac clipboard into the remote machine via HID).
+  - **Remote → Local snippet OCR** with `⌘⇧C`: drag a rectangle on the video, Overlook OCRs the region and copies the text to your Mac clipboard.
 
 If you spend time in BIOS/UEFI, bootloaders, headless servers, or “the machine that’s *just* out of reach”, Overlook aims to make the remote console feel like a first-class Mac app.
 
@@ -20,13 +20,16 @@ If you spend time in BIOS/UEFI, bootloaders, headless servers, or “the machine
 
 ## Highlights
 
-### 1) Copy from the remote screen using ML OCR
+### 1) Copy from the remote screen with `⌘⇧C`
 
-Overlook includes an **OCR Selection Mode** that behaves like “Live Text” for a remote computer:
+Overlook includes a **one-shot snippet OCR** for pulling text off the remote:
 
-- Turn on OCR mode.
-- Drag a box on the video stream.
-- Overlook runs on-device OCR (Apple Vision framework), shows the recognized text, and you can copy it to your clipboard.
+- Press `⌘⇧C` anywhere in the Overlook window.
+- A selection overlay appears over the video.
+- Drag a rectangle around the text you want.
+- Overlook runs on-device OCR (Apple Vision framework) on that region,
+  copies the recognized text straight to your Mac clipboard, and shows a
+  brief “Text copied” HUD.
 
 This is especially useful for:
 
@@ -36,11 +39,14 @@ This is especially useful for:
 
 **Note:** OCR is performed locally on your Mac.
 
-### 2) Paste to the remote machine with `⌘V`
+### 2) Paste the Mac clipboard to the remote with `⌘⇧V`
 
-Overlook intercepts `⌘V` while input capture is enabled and sends the macOS clipboard to the remote via the device’s HID “print text” API.
+When connected and input capture is active, `⌘⇧V` reads your macOS
+clipboard and sends it to the remote machine via the device’s HID
+text-entry API.
 
-This replaces the old “Paste to Remote” settings UI: the workflow is now the shortcut you already expect.
+Plain `⌘V` is forwarded to the remote as-is (i.e. the remote OS
+interprets it against its own clipboard).
 
 ### 3) Low-latency WebRTC video
 
@@ -135,82 +141,74 @@ Once connected:
 
 ---
 
-## OCR Copy Mode (Remote → Local)
+## Snippet OCR (Remote → Local)
 
-### Enable OCR mode
+### Capture text with `⌘⇧C`
 
-You can enable OCR mode from:
-
-- The main toolbar button (document/text icon).
-- The fullscreen hover controls.
-- The menu bar item (also supports a global shortcut).
-
-When OCR mode is enabled:
-
-- Overlook captures video frames from the WebRTC stream.
-- It periodically detects text regions and overlays bounding boxes.
-
-### Select text
-
-OCR selection supports two gestures:
-
-- **Click:** OCR a small region around the click point.
-- **Drag a rectangle:** OCR the selected region.
-
-Overlook then shows a “Recognized Text” sheet where you can:
-
-- Copy the recognized text to your macOS clipboard.
-- Close the sheet.
+1. Press `⌘⇧C` inside the Overlook window.
+2. Drag a rectangle around the text region you want.
+3. Overlook OCRs the selection, copies the text to your Mac clipboard,
+   and flashes a brief HUD. No result sheet — paste normally in any Mac
+   app.
 
 ### Notes / limitations
 
-- OCR accuracy depends on resolution, compression, font size, and contrast.
-- OCR is currently tuned for English but uses automatic language detection.
-- OCR works even when the remote machine has no clipboard support.
-
----
+- OCR accuracy depends on resolution, compression, font size, and
+  contrast.
+- OCR is tuned for English with automatic language detection.
+- Press `Escape` during selection to cancel.
 
 ## Clipboard Paste (Local → Remote)
 
-### Paste with `⌘V`
+### Paste with `⌘⇧V`
 
 When connected and input capture is active:
 
-- Press `⌘V` on your Mac.
-- Overlook reads your macOS clipboard and sends it to the remote machine via the device’s HID text entry API.
+- Press `⌘⇧V` on your Mac.
+- Overlook reads your Mac clipboard and types it to the remote via the
+  device’s HID text-entry API.
 
 This is ideal for:
 
 - Commands
 - URLs
-- Password manager output (use responsibly)
+- Password-manager output (use responsibly)
 - Small scripts / config snippets
 
 ### Tips
 
-- If you paste a very large block of text, the remote side may take time to process.
-- For best reliability, paste smaller chunks when interacting with BIOS/UEFI or slow boot environments.
+- Large pastes may take time for the remote to process. Paste in smaller
+  chunks in BIOS/UEFI or slow boot environments.
 
 ---
 
 ## Keyboard shortcuts
 
-Overlook includes a few “quality of life” shortcuts.
+Overlook forwards most key events to the remote while input capture is
+enabled. A small local whitelist keeps common Mac shortcuts working.
 
-### In-session shortcuts (while keyboard capture is enabled)
+### Local (stay on the Mac / consumed by Overlook)
 
-- `⌘C`: toggles OCR selection mode (so you can “copy” from the remote screen).
-- `⌘V`: pastes macOS clipboard to the remote.
+- `⌘⇧C`: start the one-shot snippet OCR described above.
+- `⌘⇧V`: type the Mac clipboard into the remote via HID.
+- `⌘⇧` + any other key: stays local (not forwarded).
+- `⌘Tab`: macOS app switcher.
+- `⌥Tab`: passes through locally (useful with third-party window
+  switchers).
+- `Escape` while the snippet overlay is showing: cancel without OCR.
+
+### Forwarded to the remote
+
+Everything else, including `⌘C`, `⌘V`, `⌘Q`, `⌘W`, `⌘H`, `⌘M`, and so
+on. If you need to quit Overlook via the keyboard, either disable input
+capture first (open the Settings panel) or use `⌘⌥Esc` to force-quit.
 
 ### Menu bar global shortcuts
 
-The menu bar agent listens for global shortcuts using `⌘⇧` modifiers:
+The menu bar agent listens for these when Overlook is NOT focused:
 
-- `⌘⇧O`: Toggle OCR.
 - `⌘⇧R`: Scan for devices.
 - `⌘⇧V`: Open Quick Connect.
-
-(These are intended as fast, “from anywhere” actions.)
 
 ---
 
@@ -256,7 +254,7 @@ Overlook’s settings UI lives in `Overlook/WebUISettingsPanel.swift` and is des
 - Try toggling reconnect.
 - Check the window title stats (bitrate/fps) to confirm frames are arriving.
 
-### “OCR doesn’t detect text”
+### “Snippet OCR doesn’t detect text”
 
 - Increase stream quality (higher bitrate helps OCR).
 - Make the text larger on the remote side.
@@ -286,11 +284,11 @@ Overlook’s settings UI lives in `Overlook/WebUISettingsPanel.swift` and is des
   - Optional audio/mic track.
 - `Overlook/InputManager.swift`
   - Keyboard/mouse capture.
-  - Local→remote paste (`⌘V`).
+  - Local→remote paste (`⌘⇧V`) and snippet OCR trigger (`⌘⇧C`).
   - HID transport via WebSocket to the device.
 - `Overlook/OCRManager.swift` + `Overlook/OCRViews.swift`
   - Apple Vision OCR pipeline.
-  - Text region overlay + “Recognized Text” sheet.
+  - One-shot selection overlay + clipboard copy HUD.
 - `Overlook/GLKVMClient.swift`
   - Device HTTP APIs (streamer params, system config, EDID, HID print, etc.).
 - `Overlook/KVMDeviceManager.swift`
