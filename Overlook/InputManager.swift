@@ -5,7 +5,10 @@ import Combine
 import SwiftUI
 
 extension Notification.Name {
+    // TODO(task 6): remove once no caller/listener references it.
     static let overlookToggleCopyMode = Notification.Name("overlook.toggleCopyMode")
+    static let overlookStartSnippet = Notification.Name("overlook.startSnippet")
+    static let overlookCancelSnippet = Notification.Name("overlook.cancelSnippet")
 }
 
 @MainActor
@@ -36,6 +39,7 @@ class InputManager: ObservableObject {
     
     @Published var isKeyboardCaptureEnabled = false
     @Published var isMouseCaptureEnabled = false
+    @Published var isSnippetModeActive: Bool = false
 
     enum TransportMode: String, CaseIterable {
         case webRTC
@@ -44,6 +48,15 @@ class InputManager: ObservableObject {
 
     @Published var transportMode: TransportMode = .glkvmWebSocket
     
+    func setSnippetModeActive(_ active: Bool) {
+        isSnippetModeActive = active
+        if active {
+            pendingCommandKeyCode = nil
+            activeCommandKeyCode = nil
+            commandKeySentToRemote = false
+        }
+    }
+
     func setup(with webRTCManager: WebRTCManager) {
         self.webRTCManager = webRTCManager
     }
