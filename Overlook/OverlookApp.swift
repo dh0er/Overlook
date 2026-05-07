@@ -33,6 +33,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let kvmDeviceManager = KVMDeviceManager()
     
     func applicationDidFinishLaunching(_ notification: Notification) {
+        OverlookLog.info("Application launched. logPath=\(OverlookLog.fileURL.path)")
+
         menuBarAgent = MenuBarAgent(
             kvmDeviceManager: kvmDeviceManager,
             webRTCManager: webRTCManager,

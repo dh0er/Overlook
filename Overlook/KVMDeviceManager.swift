@@ -40,6 +40,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }()
 
     private static let savedDevicesKey = "overlook.saved_devices.v1"
+    private static let sharedDefaults = UserDefaults(suiteName: "com.overlook.app") ?? .standard
 
     private struct PersistedDevice: Codable, Hashable {
         let host: String
@@ -71,6 +72,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     private func setupNetworkMonitoring() {
         networkMonitor = NWPathMonitor()
         networkMonitor?.pathUpdateHandler = { [weak self] path in
+            OverlookLog.info("NWPath status=\(path.status) unsatisfiedReason=\(String(describing: path.unsatisfiedReason)) interfaces=\(path.availableInterfaces.map { $0.name }.joined(separator: ","))")
             Task { @MainActor in
                 if path.status == .satisfied, self?.autoScanEnabled == true {
                     self?.scanForDevices()
@@ -676,10 +678,22 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     
     @discardableResult
     func connectToDevice(_ device: KVMDevice, authToken: String? = nil, password: String? = nil, user: String = "admin") async throws -> KVMDevice {
-        // Validate device connection
-        let isValid = try await validateDeviceConnection(device)
-        guard isValid else {
-            throw KVMError.connectionFailed
+        OverlookLog.info("KVMDeviceManager connect start host=\(device.host) port=\(device.port) type=\(device.type.rawValue) tokenLen=\(device.authToken.count) suppliedToken=\((authToken?.isEmpty == false)) passwordProvided=\((password?.isEmpty == false))")
+
+        // Treat the raw TCP probe as advisory only. It can false-negative in
+        // optimized/hardened builds, while the real GLKVM HTTP request below
+        // still succeeds and gives us better errors when it does not.
+        do {
+            let isValid = try await validateDeviceConnection(device)
+            if isValid == false {
+                OverlookLog.error("TCP probe failed host=\(device.host) port=\(device.port); trying GLKVM API anyway")
+                NSLog("[Overlook connect] TCP probe failed for %@:%d; trying GLKVM API anyway", device.host, device.port)
+            } else {
+                OverlookLog.info("TCP probe succeeded host=\(device.host) port=\(device.port)")
+            }
+        } catch {
+            OverlookLog.error("TCP probe threw host=\(device.host) port=\(device.port) error=\(OverlookLog.describe(error)); trying GLKVM API anyway")
+            NSLog("[Overlook connect] TCP probe threw for %@:%d: %@; trying GLKVM API anyway", device.host, device.port, "\(error)")
         }
         
         // Update device auth token if provided
@@ -699,17 +713,23 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         }
 
         guard let client = try? GLKVMClient(device: finalDevice, allowInsecureTLS: true) else {
+            OverlookLog.error("GLKVMClient init failed host=\(finalDevice.host) port=\(finalDevice.port)")
             throw KVMError.connectionFailed
         }
+        OverlookLog.info("GLKVMClient ready baseURL=\(client.baseURL.absoluteString) tokenLen=\(finalDevice.authToken.count)")
         NSLog("[Overlook connect] %@:%d baseURL=%@ tokenLen=%d", finalDevice.host, finalDevice.port, client.baseURL.absoluteString, finalDevice.authToken.count)
 
         do {
+            OverlookLog.info("authCheck start host=\(finalDevice.host) port=\(finalDevice.port)")
             try await client.authCheck()
+            OverlookLog.info("authCheck OK host=\(finalDevice.host) port=\(finalDevice.port)")
             NSLog("[Overlook connect] authCheck OK")
         } catch {
+            OverlookLog.error("authCheck threw host=\(finalDevice.host) port=\(finalDevice.port) error=\(OverlookLog.describe(error))")
             NSLog("[Overlook connect] authCheck threw: %@", "\(error)")
             if let password, !password.isEmpty {
                 do {
+                    OverlookLog.info("authLogin start host=\(finalDevice.host) port=\(finalDevice.port) user=\(user) passwordLength=\(password.count)")
                     let token = try await client.authLogin(user: user, password: password)
                     client.authToken = token
 
@@ -719,12 +739,15 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                         availableDevices[index] = updated
                     }
                     finalDevice = updated
+                    OverlookLog.info("authLogin OK host=\(finalDevice.host) port=\(finalDevice.port) tokenLen=\(token.count)")
                     NSLog("[Overlook connect] authLogin OK")
                 } catch {
+                    OverlookLog.error("authLogin threw host=\(finalDevice.host) port=\(finalDevice.port) error=\(OverlookLog.describe(error))")
                     NSLog("[Overlook connect] authLogin threw: %@", "\(error)")
                     throw error
                 }
             } else {
+                OverlookLog.info("authCheck failed and no password provided; requesting password host=\(finalDevice.host) port=\(finalDevice.port)")
                 throw KVMError.authenticationFailed
             }
         }
@@ -732,6 +755,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         let persisted = persistDevice(finalDevice)
         connectedDevice = persisted
         glkvmClient = client
+        OverlookLog.info("KVMDeviceManager connect complete host=\(persisted.host) port=\(persisted.port) savedId=\(persisted.id)")
         return persisted
     }
 
@@ -786,12 +810,14 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
 
     private func readPersistedDevices() -> [PersistedDevice] {
-        guard let data = UserDefaults.standard.data(forKey: Self.savedDevicesKey) else { return [] }
+        guard let data = Self.sharedDefaults.data(forKey: Self.savedDevicesKey)
+                ?? UserDefaults.standard.data(forKey: Self.savedDevicesKey) else { return [] }
         return (try? JSONDecoder().decode([PersistedDevice].self, from: data)) ?? []
     }
 
     private func writePersistedDevices(_ devices: [PersistedDevice]) {
         guard let data = try? JSONEncoder().encode(devices) else { return }
+        Self.sharedDefaults.set(data, forKey: Self.savedDevicesKey)
         UserDefaults.standard.set(data, forKey: Self.savedDevicesKey)
     }
     
@@ -821,6 +847,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             queue.asyncAfter(deadline: .now() + 5, execute: timeoutWorkItem)
 
             connection.stateUpdateHandler = { (state: NWConnection.State) in
+                OverlookLog.info("TCP probe state host=\(device.host) port=\(device.port) state=\(state)")
                 switch state {
                 case .ready:
                     if finished.value { return }

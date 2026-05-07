@@ -67,4 +67,10 @@ fi
 mkdir -p "$DEST_DIR"
 rm -rf "$DEST_DIR/$FULL_PRODUCT_NAME"
 cp -R "$APP_SRC" "$DEST_DIR/"
+
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
+if [[ -x "$LSREGISTER" ]]; then
+  "$LSREGISTER" -f -R -trusted "$DEST_DIR/$FULL_PRODUCT_NAME"
+fi
+
 echo "Copied $FULL_PRODUCT_NAME -> $DEST_DIR/"

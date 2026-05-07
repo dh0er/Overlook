@@ -29,6 +29,8 @@ struct ContentView: View {
 
     @State private var showingConnections = false
     @State private var didAutoOpenConnections = false
+    @State private var isConnectionBusy = false
+    @State private var connectionErrorMessage: String?
 
     @State private var pausedCaptureKeyboardWasEnabled: Bool?
     @State private var pausedCaptureMouseWasEnabled: Bool?
@@ -117,10 +119,7 @@ struct ContentView: View {
                     selectedText: $selectedText,
                     isShowingOCRResult: $isShowingOCRResult,
                     onReconnect: {
-                        guard let device = kvmDeviceManager.connectedDevice else { return }
-                        Task { @MainActor in
-                            await webRTCManager.reconnect(to: device)
-                        }
+                        reconnectCurrentSession()
                     }
                 )
                 .ignoresSafeArea()
@@ -131,10 +130,7 @@ struct ContentView: View {
                     selectedText: $selectedText,
                     isShowingOCRResult: $isShowingOCRResult,
                     onReconnect: {
-                        guard let device = kvmDeviceManager.connectedDevice else { return }
-                        Task { @MainActor in
-                            await webRTCManager.reconnect(to: device)
-                        }
+                        reconnectCurrentSession()
                     }
                 )
                 .allowsHitTesting(!showingSettings)
@@ -243,6 +239,8 @@ struct ContentView: View {
                     inboundAudioJitterMs: webRTCManager.inboundAudioJitterMs,
                     inboundAudioPacketsLost: webRTCManager.inboundAudioPacketsLost,
                     audioIceCurrentRoundTripTimeMs: webRTCManager.audioIceCurrentRoundTripTimeMs,
+                    isConnectionBusy: isConnectionBusy,
+                    connectionErrorMessage: connectionErrorMessage,
                     onScan: {
                         kvmDeviceManager.scanForDevices()
                     },
@@ -357,6 +355,7 @@ struct ContentView: View {
                 },
                 onConnect: {
                     if let device = pendingPasswordDevice {
+                        OverlookLog.info("Password prompt submitted host=\(device.host) port=\(device.port) passwordLength=\(pendingPassword.count)")
                         connectToDevice(device, password: pendingPassword)
                     }
                     pendingPasswordDevice = nil
@@ -395,48 +394,93 @@ struct ContentView: View {
     }
 
     private func connectToDevice(_ device: KVMDevice, password: String? = nil) {
-        Task {
+        guard isConnectionBusy == false else { return }
+
+        OverlookLog.info("UI connect requested host=\(device.host) port=\(device.port) id=\(device.id) passwordProvided=\((password?.isEmpty == false))")
+        isConnectionBusy = true
+        connectionErrorMessage = nil
+
+        Task { @MainActor in
+            defer {
+                isConnectionBusy = false
+            }
+
             do {
                 let connectedDevice = try await kvmDeviceManager.connectToDevice(device, password: password)
-                await MainActor.run {
-                    suppressDeviceAutoConnect = true
-                    selectedDevice = connectedDevice
-                    isConnected = true
-                    showingConnections = false
-                }
+                OverlookLog.info("KVM API connect succeeded host=\(connectedDevice.host) port=\(connectedDevice.port)")
+                suppressDeviceAutoConnect = true
+                selectedDevice = connectedDevice
+                isConnected = true
+                showingConnections = false
                 DispatchQueue.main.async {
                     suppressDeviceAutoConnect = false
                 }
 
                 if let client = kvmDeviceManager.glkvmClient {
-                    await MainActor.run {
-                        inputManager.setGLKVMClient(client)
-                        inputManager.startFullInputCapture()
-                    }
+                    inputManager.setGLKVMClient(client)
+                    inputManager.startFullInputCapture()
                     try? await client.setHidConnected(true)
                 }
 
  #if canImport(WebRTC)
                 do {
                     try await webRTCManager.connect(to: connectedDevice)
+                    OverlookLog.info("WebRTC connect succeeded host=\(connectedDevice.host) port=\(connectedDevice.port)")
                 } catch {
+                    OverlookLog.error("WebRTC connect failed host=\(connectedDevice.host) port=\(connectedDevice.port) error=\(OverlookLog.describe(error))")
                     print("WebRTC connect failed (API is still connected): \(error)")
                 }
  #endif
             } catch {
                 if let kvmError = error as? KVMError, kvmError == .authenticationFailed {
-                    await MainActor.run {
-                        pendingPasswordDevice = device
-                        showingPasswordPrompt = true
-                    }
+                    pendingPasswordDevice = device
+                    showingPasswordPrompt = true
                 } else {
+                    OverlookLog.error("UI connect failed host=\(device.host) port=\(device.port) error=\(OverlookLog.describe(error))")
                     print("Failed to connect: \(error)")
-                    await MainActor.run {
-                        isConnected = false
-                    }
+                    connectionErrorMessage = connectionFailureMessage(error, device: device)
+                    isConnected = false
                 }
                 return
             }
+        }
+    }
+
+    private func connectionFailureMessage(_ error: Error, device: KVMDevice) -> String {
+        return "Failed to connect to \(device.host):\(device.port): \(connectionErrorDetail(error))"
+    }
+
+    private func connectionErrorDetail(_ error: Error) -> String {
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain {
+            return nsError.localizedDescription
+        }
+
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return "\(nsError.localizedDescription) (\(underlying.localizedDescription))"
+        }
+
+        return error.localizedDescription
+    }
+
+    private func reconnectCurrentSession() {
+        guard let device = kvmDeviceManager.connectedDevice ?? deviceForConnection() else {
+            connectionErrorMessage = "Select a device before reconnecting."
+            return
+        }
+
+        let client = kvmDeviceManager.glkvmClient
+
+        webRTCManager.disconnect()
+        inputManager.setGLKVMClient(nil)
+        inputManager.stopFullInputCapture()
+        kvmDeviceManager.disconnectFromDevice()
+        isConnected = false
+
+        Task { @MainActor in
+            try? await client?.setHidConnected(false)
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            connectToDevice(device)
         }
     }
 
@@ -475,6 +519,7 @@ struct ContentView: View {
 
     private func toggleConnection() {
         if isConnected {
+            connectionErrorMessage = nil
             webRTCManager.disconnect()
 
             let client = kvmDeviceManager.glkvmClient
@@ -487,9 +532,21 @@ struct ContentView: View {
             inputManager.stopFullInputCapture()
             isConnected = false
             showingConnections = true
-        } else if let device = selectedDevice {
+        } else if let device = deviceForConnection() {
             connectToDevice(device)
+        } else {
+            connectionErrorMessage = "Select a device before connecting."
         }
+    }
+
+    private func deviceForConnection() -> KVMDevice? {
+        if let selectedDevice {
+            return selectedDevice
+        }
+        if kvmDeviceManager.availableDevices.count == 1 {
+            return kvmDeviceManager.availableDevices[0]
+        }
+        return nil
     }
     
     @MainActor
@@ -849,6 +906,8 @@ struct ConnectionsPopoverView: View {
     let inboundAudioJitterMs: Int?
     let inboundAudioPacketsLost: Int?
     let audioIceCurrentRoundTripTimeMs: Int?
+    let isConnectionBusy: Bool
+    let connectionErrorMessage: String?
 
     let onScan: () -> Void
     let onManualConnect: () -> Void
@@ -874,6 +933,7 @@ struct ConnectionsPopoverView: View {
         let audioJitterText = inboundAudioJitterMs.map { "\($0) ms" } ?? "—"
         let audioLossText = inboundAudioPacketsLost.map { String($0) } ?? "—"
         let audioRttText = audioIceCurrentRoundTripTimeMs.map { "\($0) ms" } ?? "—"
+        let displayedDevice = selectedDevice ?? (devices.count == 1 ? devices[0] : nil)
 
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -881,9 +941,14 @@ struct ConnectionsPopoverView: View {
                     .font(.headline)
                 Spacer()
                 Button(action: onToggleConnection) {
-                    Image(systemName: isConnected ? "personalhotspot.slash" : "personalhotspot")
+                    if isConnectionBusy {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: isConnected ? "personalhotspot.slash" : "personalhotspot")
+                    }
                 }
-                .disabled(!isConnected && selectedDevice == nil)
+                .disabled(isConnectionBusy || (!isConnected && selectedDevice == nil && devices.count != 1))
                 .help(isConnected ? "Disconnect" : "Connect")
             }
 
@@ -914,8 +979,17 @@ struct ConnectionsPopoverView: View {
 
             Divider()
 
+            if let connectionErrorMessage, !connectionErrorMessage.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(connectionErrorMessage)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             VStack(alignment: .leading, spacing: 6) {
-                Text(connectedDeviceName ?? (selectedDevice?.name ?? "No Device"))
+                Text(connectedDeviceName ?? (displayedDevice?.name ?? "No Device"))
                     .font(.caption)
 
                 HStack {
