@@ -16,6 +16,7 @@ class InputManager: ObservableObject {
     private var glkvmWebSocketClient: GLKVMClient.WebSocketClient?
     private var keyEventMonitor: Any?
     private var mouseEventMonitor: Any?
+    private var appDeactivationObserver: NSObjectProtocol?
     private var isCapturing = false
 
     private struct PendingAbsoluteMouseMove {
@@ -44,6 +45,18 @@ class InputManager: ObservableObject {
     @Published var isKeyboardCaptureEnabled = false
     @Published var isMouseCaptureEnabled = false
     @Published var isSnippetModeActive: Bool = false
+
+    init() {
+        appDeactivationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.clearOneShotLocalShortcutState()
+            }
+        }
+    }
 
     enum TransportMode: String, CaseIterable {
         case webRTC
@@ -214,6 +227,7 @@ class InputManager: ObservableObject {
     
     func stopKeyboardCapture() {
         isKeyboardCaptureEnabled = false
+        clearOneShotLocalShortcutState()
         
         if let monitor = keyEventMonitor {
             NSEvent.removeMonitor(monitor)
@@ -443,6 +457,11 @@ class InputManager: ObservableObject {
         pendingCommandKeyCode = nil
         activeCommandKeyCode = nil
         commandKeySentToRemote = false
+    }
+
+    private func clearOneShotLocalShortcutState() {
+        passthroughKeyCodes.removeAll()
+        suppressedKeyUps.removeAll()
     }
 
     private func resyncModifiersAfterSnippetMode() {
@@ -866,6 +885,11 @@ class InputManager: ObservableObject {
         if let monitor = mouseEventMonitor {
             NSEvent.removeMonitor(monitor)
             mouseEventMonitor = nil
+        }
+
+        if let observer = appDeactivationObserver {
+            NotificationCenter.default.removeObserver(observer)
+            appDeactivationObserver = nil
         }
     }
 
