@@ -19,6 +19,8 @@ struct VideoSurfaceView: View {
     @State private var snippetDragCurrent: CGPoint?
     @State private var snippetHUDMessage: String?
     @State private var snippetHUDHideTask: Task<Void, Never>?
+    @State private var snippetOCRTask: Task<Void, Never>?
+    @State private var snippetOCRRequestID: UUID?
 
     @State private var isHoveringStream = false
     @AppStorage(TrackingContainerView.hideSystemCursorDefaultsKey) private var hideSystemCursorOverStream: Bool = false
@@ -245,6 +247,10 @@ struct VideoSurfaceView: View {
     }
 
     private func exitSnippetMode() {
+        snippetOCRTask?.cancel()
+        snippetOCRTask = nil
+        snippetOCRRequestID = nil
+
         guard isSnippetModeActive else { return }
         isSnippetModeActive = false
         snippetDragStart = nil
@@ -300,11 +306,19 @@ struct VideoSurfaceView: View {
 
         let frame = webRTCManager.currentFrame
 
-        Task {
+        snippetOCRTask?.cancel()
+        let requestID = UUID()
+        snippetOCRRequestID = requestID
+
+        snippetOCRTask = Task {
             do {
                 let text = try await ocrManager.recognizeTextInRegion(region, in: frame)
+                try Task.checkCancellation()
                 await MainActor.run {
+                    guard snippetOCRRequestID == requestID, isSnippetModeActive else { return }
                     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    snippetOCRTask = nil
+                    snippetOCRRequestID = nil
                     guard !trimmed.isEmpty else {
                         showSnippetHUD("No text found")
                         exitSnippetMode()
@@ -316,14 +330,22 @@ struct VideoSurfaceView: View {
                     showSnippetHUD("Text copied")
                     exitSnippetMode()
                 }
+            } catch is CancellationError {
+                return
             } catch OCRError.noTextFound {
                 await MainActor.run {
+                    guard snippetOCRRequestID == requestID, isSnippetModeActive else { return }
+                    snippetOCRTask = nil
+                    snippetOCRRequestID = nil
                     showSnippetHUD("No text found")
                     exitSnippetMode()
                 }
             } catch {
                 print("Snippet OCR failed: \(error)")
                 await MainActor.run {
+                    guard snippetOCRRequestID == requestID, isSnippetModeActive else { return }
+                    snippetOCRTask = nil
+                    snippetOCRRequestID = nil
                     showSnippetHUD("OCR failed")
                     exitSnippetMode()
                 }
