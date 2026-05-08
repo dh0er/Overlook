@@ -254,6 +254,36 @@ class InputManager: ObservableObject {
     private func handleKeyEventDuringSnippet(_ event: NSEvent) -> NSEvent? {
         if event.type == .keyDown, event.keyCode == 53 { // Escape
             NotificationCenter.default.post(name: .overlookCancelSnippet, object: nil)
+            return nil
+        }
+
+        switch event.type {
+        case .keyUp:
+            if passthroughKeyCodes.contains(event.keyCode) {
+                passthroughKeyCodes.remove(event.keyCode)
+                return event
+            }
+
+            if suppressedKeyUps.contains(event.keyCode) {
+                suppressedKeyUps.remove(event.keyCode)
+                return nil
+            }
+
+            let keyEvent = KeyEvent(
+                keyCode: event.keyCode,
+                isKeyDown: false,
+                modifiers: event.modifierFlags,
+                timestamp: event.timestamp
+            )
+            sendKeyEvent(keyEvent)
+
+        case .flagsChanged:
+            if isModifierReleaseEvent(event) {
+                handleFlagsChanged(event)
+            }
+
+        default:
+            break
         }
         return nil
     }
@@ -286,6 +316,7 @@ class InputManager: ObservableObject {
                 return nil
             case .some(.startSnippet):
                 releaseRemoteCommandForLocalShortcut()
+                releaseRemoteModifiersForLocalShortcut(modifiers: modifiers, timestamp: event.timestamp)
                 suppressedKeyUps.insert(keyCode)
                 NotificationCenter.default.post(name: .overlookStartSnippet, object: nil)
                 return nil
@@ -375,6 +406,29 @@ class InputManager: ObservableObject {
         sendKeyEvent(keyEvent)
     }
 
+    private func isModifierReleaseEvent(_ event: NSEvent) -> Bool {
+        guard event.type == .flagsChanged,
+              let keyName = glkvmKeyForMacKeyCode(event.keyCode) else {
+            return false
+        }
+
+        let flags = event.modifierFlags
+        switch keyName {
+        case "ShiftLeft", "ShiftRight":
+            return !flags.contains(.shift)
+        case "ControlLeft", "ControlRight":
+            return !flags.contains(.control)
+        case "AltLeft", "AltRight":
+            return !flags.contains(.option)
+        case "MetaLeft", "MetaRight":
+            return !flags.contains(.command)
+        case "CapsLock":
+            return !flags.contains(.capsLock)
+        default:
+            return false
+        }
+    }
+
     private enum LocalKeyAction {
         case passthrough
         case pasteClipboard
@@ -433,6 +487,33 @@ class InputManager: ObservableObject {
         pendingCommandKeyCode = activeCommandKeyCode ?? pendingCommandKeyCode
         activeCommandKeyCode = nil
         commandKeySentToRemote = false
+    }
+
+    private func releaseRemoteModifiersForLocalShortcut(modifiers: NSEvent.ModifierFlags, timestamp: TimeInterval) {
+        var keyCodes: [UInt16] = []
+
+        if modifiers.contains(.shift) {
+            keyCodes.append(contentsOf: [56, 60])
+        }
+        if modifiers.contains(.control) {
+            keyCodes.append(contentsOf: [59, 62])
+        }
+        if modifiers.contains(.option) {
+            keyCodes.append(contentsOf: [58, 61])
+        }
+        if modifiers.contains(.command) {
+            keyCodes.append(contentsOf: [55, 54])
+        }
+
+        for keyCode in keyCodes {
+            let keyEvent = KeyEvent(
+                keyCode: keyCode,
+                isKeyDown: false,
+                modifiers: modifiers,
+                timestamp: timestamp
+            )
+            sendKeyEvent(keyEvent)
+        }
     }
 
     private func flushPendingCommandKeyIfNeeded(timestamp: TimeInterval, modifiers: NSEvent.ModifierFlags) {

@@ -305,6 +305,12 @@ struct VideoSurfaceView: View {
                 let text = try await ocrManager.recognizeTextInRegion(region, in: frame)
                 await MainActor.run {
                     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else {
+                        showSnippetHUD("No text found")
+                        exitSnippetMode()
+                        return
+                    }
+
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(trimmed, forType: .string)
                     showSnippetHUD("Text copied")
