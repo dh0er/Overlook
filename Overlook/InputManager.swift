@@ -254,36 +254,11 @@ class InputManager: ObservableObject {
     private func handleKeyEventDuringSnippet(_ event: NSEvent) -> NSEvent? {
         if event.type == .keyDown, event.keyCode == 53 { // Escape
             NotificationCenter.default.post(name: .overlookCancelSnippet, object: nil)
-            return nil
         }
 
-        switch event.type {
-        case .keyUp:
-            if passthroughKeyCodes.contains(event.keyCode) {
-                passthroughKeyCodes.remove(event.keyCode)
-                return event
-            }
-
-            if suppressedKeyUps.contains(event.keyCode) {
-                suppressedKeyUps.remove(event.keyCode)
-                return nil
-            }
-
-            let keyEvent = KeyEvent(
-                keyCode: event.keyCode,
-                isKeyDown: false,
-                modifiers: event.modifierFlags,
-                timestamp: event.timestamp
-            )
-            sendKeyEvent(keyEvent)
-
-        case .flagsChanged:
-            if isModifierReleaseEvent(event) {
-                handleFlagsChanged(event)
-            }
-
-        default:
-            break
+        if event.type == .keyUp {
+            passthroughKeyCodes.remove(event.keyCode)
+            suppressedKeyUps.remove(event.keyCode)
         }
         return nil
     }
@@ -404,29 +379,6 @@ class InputManager: ObservableObject {
             timestamp: event.timestamp
         )
         sendKeyEvent(keyEvent)
-    }
-
-    private func isModifierReleaseEvent(_ event: NSEvent) -> Bool {
-        guard event.type == .flagsChanged,
-              let keyName = glkvmKeyForMacKeyCode(event.keyCode) else {
-            return false
-        }
-
-        let flags = event.modifierFlags
-        switch keyName {
-        case "ShiftLeft", "ShiftRight":
-            return !flags.contains(.shift)
-        case "ControlLeft", "ControlRight":
-            return !flags.contains(.control)
-        case "AltLeft", "AltRight":
-            return !flags.contains(.option)
-        case "MetaLeft", "MetaRight":
-            return !flags.contains(.command)
-        case "CapsLock":
-            return !flags.contains(.capsLock)
-        default:
-            return false
-        }
     }
 
     private enum LocalKeyAction {
