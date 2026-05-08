@@ -27,6 +27,7 @@ class InputManager: ObservableObject {
     private var lastSentMouseMove: PendingAbsoluteMouseMove?
     private var mouseMoveSenderTask: Task<Void, Never>?
     private static let mouseMoveSendIntervalNs: UInt64 = 4_166_667
+    private static let defaultCommandKeyCode: UInt16 = 55
 
     private var lastCursorDiagLogTime: CFTimeInterval = 0
 
@@ -48,11 +49,12 @@ class InputManager: ObservableObject {
     @Published var transportMode: TransportMode = .glkvmWebSocket
     
     func setSnippetModeActive(_ active: Bool) {
+        let wasActive = isSnippetModeActive
         isSnippetModeActive = active
         if active {
-            pendingCommandKeyCode = nil
-            activeCommandKeyCode = nil
-            commandKeySentToRemote = false
+            clearPendingCommandKey()
+        } else if wasActive {
+            resyncCommandModifierAfterSnippetMode()
         }
     }
 
@@ -286,6 +288,7 @@ class InputManager: ObservableObject {
                 return event
             case .some(.pasteClipboard):
                 releaseRemoteCommandForLocalShortcut()
+                releaseRemoteModifiersForLocalShortcut(modifiers: modifiers, timestamp: event.timestamp)
                 suppressedKeyUps.insert(keyCode)
                 pasteClipboardToRemote()
                 return nil
@@ -407,10 +410,10 @@ class InputManager: ObservableObject {
         }
 
         if cmd, shift {
-            if keyCode == vKeyCode {
+            if !option, !control, keyCode == vKeyCode {
                 return .pasteClipboard
             }
-            if keyCode == cKeyCode {
+            if !option, !control, keyCode == cKeyCode {
                 return .startSnippet
             }
             return .passthrough
@@ -423,6 +426,16 @@ class InputManager: ObservableObject {
         pendingCommandKeyCode = nil
         activeCommandKeyCode = nil
         commandKeySentToRemote = false
+    }
+
+    private func resyncCommandModifierAfterSnippetMode() {
+        if NSEvent.modifierFlags.contains(.command) {
+            pendingCommandKeyCode = Self.defaultCommandKeyCode
+            activeCommandKeyCode = nil
+            commandKeySentToRemote = false
+        } else {
+            clearPendingCommandKey()
+        }
     }
 
     private func releaseRemoteCommandForLocalShortcut() {
