@@ -227,6 +227,7 @@ class InputManager: ObservableObject {
     
     func stopKeyboardCapture() {
         isKeyboardCaptureEnabled = false
+        releaseTrackedRemoteModifiersForCaptureStop()
         clearOneShotLocalShortcutState()
         
         if let monitor = keyEventMonitor {
@@ -462,6 +463,23 @@ class InputManager: ObservableObject {
     private func clearOneShotLocalShortcutState() {
         passthroughKeyCodes.removeAll()
         suppressedKeyUps.removeAll()
+    }
+
+    private func releaseTrackedRemoteModifiersForCaptureStop() {
+        let modifiers = NSEvent.modifierFlags
+        let timestamp = CACurrentMediaTime()
+
+        for keyCode in remotePressedModifierKeyCodes.sorted() {
+            sendTrackedModifierKeyEvent(
+                keyCode: keyCode,
+                isDown: false,
+                modifiers: modifiers,
+                timestamp: timestamp
+            )
+        }
+
+        locallySuppressedModifierKeyCodes.removeAll()
+        clearPendingCommandKey()
     }
 
     private func resyncModifiersAfterSnippetMode() {
