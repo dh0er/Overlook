@@ -12,21 +12,21 @@ struct VideoSurfaceView: View {
     @EnvironmentObject var inputManager: InputManager
     @EnvironmentObject var ocrManager: OCRManager
 
-    @Binding var isOCRModeEnabled: Bool
-    @Binding var selectedText: String
-    @Binding var isShowingOCRResult: Bool
-
     let onReconnect: () -> Void
 
-    @State private var ocrDragStart: CGPoint?
-    @State private var ocrDragCurrent: CGPoint?
-    @State private var ocrRegionsTask: Task<Void, Never>?
+    @State private var isSnippetModeActive: Bool = false
+    @State private var snippetDragStart: CGPoint?
+    @State private var snippetDragCurrent: CGPoint?
+    @State private var snippetHUDMessage: String?
+    @State private var snippetHUDHideTask: Task<Void, Never>?
+    @State private var snippetOCRTask: Task<Void, Never>?
+    @State private var snippetOCRRequestID: UUID?
 
     @State private var isHoveringStream = false
     @AppStorage(TrackingContainerView.hideSystemCursorDefaultsKey) private var hideSystemCursorOverStream: Bool = false
 
-    private var ocrSelectionRect: CGRect? {
-        guard let start = ocrDragStart, let current = ocrDragCurrent else { return nil }
+    private var snippetSelectionRect: CGRect? {
+        guard let start = snippetDragStart, let current = snippetDragCurrent else { return nil }
         let x = min(start.x, current.x)
         let y = min(start.y, current.y)
         let width = abs(start.x - current.x)
@@ -44,7 +44,7 @@ struct VideoSurfaceView: View {
                     VideoViewRepresentable(
                         videoView: videoView,
                         onMouseMove: { pointInView in
-                            guard !isOCRModeEnabled else { return }
+                            guard !isSnippetModeActive else { return }
                             inputManager.handleVideoMouseMove(
                                 pointInView: pointInView,
                                 viewSize: geometry.size,
@@ -53,7 +53,7 @@ struct VideoSurfaceView: View {
                             )
                         },
                         onMouseMoveWithLayerInfo: { pointInView, layerInfo in
-                            guard !isOCRModeEnabled else { return }
+                            guard !isSnippetModeActive else { return }
                             inputManager.handleVideoMouseMove(
                                 pointInView: pointInView,
                                 viewSize: geometry.size,
@@ -63,7 +63,7 @@ struct VideoSurfaceView: View {
                             )
                         },
                         onMouseButton: { button, isDown, pointInView in
-                            guard !isOCRModeEnabled else { return }
+                            guard !isSnippetModeActive else { return }
                             inputManager.handleVideoMouseButton(
                                 button: button,
                                 isDown: isDown,
@@ -74,7 +74,7 @@ struct VideoSurfaceView: View {
                             )
                         },
                         onScrollWheel: { deltaX, deltaY in
-                            guard !isOCRModeEnabled else { return }
+                            guard !isSnippetModeActive else { return }
                             inputManager.handleVideoMouseScroll(deltaX: deltaX, deltaY: deltaY)
                         }
                     )
@@ -88,43 +88,53 @@ struct VideoSurfaceView: View {
                     .foregroundColor(.white)
 #endif
 
-                if isOCRModeEnabled {
-                    OCRSelectionOverlay(
-                        regions: ocrManager.recognizedRegions,
-                        selectionRectInView: ocrSelectionRect,
-                        viewSize: geometry.size,
-                        videoSize: currentVideoSize()
+                if isSnippetModeActive {
+                    SnippetSelectionOverlay(
+                        selectionRectInView: snippetSelectionRect,
+                        viewSize: geometry.size
                     )
-                }
 
-                if isOCRModeEnabled {
                     Color.clear
                         .contentShape(Rectangle())
                         .gesture(
                             DragGesture(minimumDistance: 0)
                                 .onChanged { value in
-                                    if ocrDragStart == nil {
-                                        ocrDragStart = value.startLocation
+                                    if snippetDragStart == nil {
+                                        snippetDragStart = value.startLocation
                                     }
-                                    ocrDragCurrent = value.location
+                                    snippetDragCurrent = value.location
                                 }
                                 .onEnded { value in
                                     let location = value.location
-                                    let start = ocrDragStart ?? value.startLocation
+                                    let start = snippetDragStart ?? value.startLocation
                                     let dx = location.x - start.x
                                     let dy = location.y - start.y
                                     let distance = hypot(dx, dy)
 
-                                    if distance < 8 {
-                                        performOCR(at: location, in: geometry)
-                                    } else if let rect = ocrSelectionRect, rect.width > 4, rect.height > 4 {
-                                        performOCR(inViewRect: rect, in: geometry)
+                                    if let rect = snippetSelectionRect,
+                                       distance >= 8,
+                                       rect.width > 4,
+                                       rect.height > 4 {
+                                        performSnippetOCR(inViewRect: rect, in: geometry)
+                                    } else {
+                                        exitSnippetMode()
                                     }
 
-                                    ocrDragStart = nil
-                                    ocrDragCurrent = nil
+                                    snippetDragStart = nil
+                                    snippetDragCurrent = nil
                                 }
                         )
+                }
+
+                if let message = snippetHUDMessage {
+                    VStack {
+                        SnippetHUD(message: message)
+                            .padding(.top, 24)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
                 }
 
                 if isShowingStatusOverlay {
@@ -175,15 +185,19 @@ struct VideoSurfaceView: View {
                 }
             }
         }
-        .onChange(of: isOCRModeEnabled) { _, enabled in
-            setOCRMode(enabled)
+        .onReceive(NotificationCenter.default.publisher(for: .overlookStartSnippet)) { _ in
+            if !isSnippetModeActive {
+                enterSnippetMode()
+            }
         }
-        .onAppear {
-            setOCRMode(isOCRModeEnabled)
+        .onReceive(NotificationCenter.default.publisher(for: .overlookCancelSnippet)) { _ in
+            exitSnippetMode()
         }
         .onDisappear {
-            ocrRegionsTask?.cancel()
-            ocrRegionsTask = nil
+            exitSnippetMode()
+            snippetHUDHideTask?.cancel()
+            snippetHUDHideTask = nil
+            snippetHUDMessage = nil
             isHoveringStream = false
             StreamCursorHider.shared.update(shouldHide: false)
         }
@@ -224,23 +238,25 @@ struct VideoSurfaceView: View {
         }
     }
 
-    private func setOCRMode(_ enabled: Bool) {
-        webRTCManager.setFrameCaptureEnabled(enabled)
-        if enabled {
-            ocrRegionsTask?.cancel()
-            ocrRegionsTask = Task { @MainActor in
-                while !Task.isCancelled && isOCRModeEnabled {
-                    _ = try? await ocrManager.detectTextRegions(in: webRTCManager.currentFrame)
-                    try? await Task.sleep(nanoseconds: 650_000_000)
-                }
-            }
-        } else {
-            ocrRegionsTask?.cancel()
-            ocrRegionsTask = nil
-            ocrDragStart = nil
-            ocrDragCurrent = nil
-            ocrManager.recognizedRegions = []
-        }
+    private func enterSnippetMode() {
+        snippetDragStart = nil
+        snippetDragCurrent = nil
+        isSnippetModeActive = true
+        inputManager.setSnippetModeActive(true)
+        webRTCManager.setFrameCaptureEnabled(true)
+    }
+
+    private func exitSnippetMode() {
+        snippetOCRTask?.cancel()
+        snippetOCRTask = nil
+        snippetOCRRequestID = nil
+
+        guard isSnippetModeActive else { return }
+        isSnippetModeActive = false
+        snippetDragStart = nil
+        snippetDragCurrent = nil
+        inputManager.setSnippetModeActive(false)
+        webRTCManager.setFrameCaptureEnabled(false)
     }
 
     private func currentVideoSize() -> CGSize? {
@@ -259,28 +275,7 @@ struct VideoSurfaceView: View {
         return CGSize(width: width, height: height)
     }
 
-    private func performOCR(at location: CGPoint, in geometry: GeometryProxy) {
-        let normalized = inputManager.normalizePointInViewToVideo(
-            pointInView: location,
-            viewSize: geometry.size,
-            videoSize: currentVideoSize()
-        )
-        let videoPoint = CGPoint(x: normalized.x, y: 1.0 - normalized.y)
-
-        Task {
-            do {
-                let text = try await ocrManager.recognizeText(at: videoPoint, in: webRTCManager.currentFrame)
-                await MainActor.run {
-                    selectedText = text
-                    isShowingOCRResult = true
-                }
-            } catch {
-                print("OCR failed: \(error)")
-            }
-        }
-    }
-
-    private func performOCR(inViewRect rect: CGRect, in geometry: GeometryProxy) {
+    private func performSnippetOCR(inViewRect rect: CGRect, in geometry: GeometryProxy) {
         let topLeft = CGPoint(x: rect.minX, y: rect.minY)
         let bottomRight = CGPoint(x: rect.maxX, y: rect.maxY)
 
@@ -289,7 +284,6 @@ struct VideoSurfaceView: View {
             viewSize: geometry.size,
             videoSize: currentVideoSize()
         )
-
         let n2 = inputManager.normalizePointInViewToVideo(
             pointInView: bottomRight,
             viewSize: geometry.size,
@@ -305,17 +299,70 @@ struct VideoSurfaceView: View {
         let maxY = min(1, max(v1.y, v2.y))
 
         let region = CGRect(x: minX, y: minY, width: max(0, maxX - minX), height: max(0, maxY - minY))
-        guard region.width > 0.001, region.height > 0.001 else { return }
+        guard region.width > 0.001, region.height > 0.001 else {
+            exitSnippetMode()
+            return
+        }
 
-        Task {
+        let frame = webRTCManager.currentFrame
+
+        snippetOCRTask?.cancel()
+        let requestID = UUID()
+        snippetOCRRequestID = requestID
+
+        snippetOCRTask = Task {
             do {
-                let text = try await ocrManager.recognizeTextInRegion(region, in: webRTCManager.currentFrame)
+                let text = try await ocrManager.recognizeTextInRegion(region, in: frame)
+                try Task.checkCancellation()
                 await MainActor.run {
-                    selectedText = text
-                    isShowingOCRResult = true
+                    guard snippetOCRRequestID == requestID, isSnippetModeActive else { return }
+                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    snippetOCRTask = nil
+                    snippetOCRRequestID = nil
+                    guard !trimmed.isEmpty else {
+                        showSnippetHUD("No text found")
+                        exitSnippetMode()
+                        return
+                    }
+
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(trimmed, forType: .string)
+                    showSnippetHUD("Text copied")
+                    exitSnippetMode()
+                }
+            } catch is CancellationError {
+                return
+            } catch OCRError.noTextFound {
+                await MainActor.run {
+                    guard snippetOCRRequestID == requestID, isSnippetModeActive else { return }
+                    snippetOCRTask = nil
+                    snippetOCRRequestID = nil
+                    showSnippetHUD("No text found")
+                    exitSnippetMode()
                 }
             } catch {
-                print("OCR failed: \(error)")
+                print("Snippet OCR failed: \(error)")
+                await MainActor.run {
+                    guard snippetOCRRequestID == requestID, isSnippetModeActive else { return }
+                    snippetOCRTask = nil
+                    snippetOCRRequestID = nil
+                    showSnippetHUD("OCR failed")
+                    exitSnippetMode()
+                }
+            }
+        }
+    }
+
+    private func showSnippetHUD(_ message: String) {
+        snippetHUDHideTask?.cancel()
+        withAnimation(.easeIn(duration: 0.1)) {
+            snippetHUDMessage = message
+        }
+        snippetHUDHideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.2)) {
+                snippetHUDMessage = nil
             }
         }
     }

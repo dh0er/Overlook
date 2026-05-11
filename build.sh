@@ -37,25 +37,23 @@ cd "$(dirname "$0")"
 
 DEST_DIR="build/$(echo "$CONFIG" | tr '[:upper:]' '[:lower:]')"
 
-echo "Building Overlook ($CONFIG)..."
-xcodebuild \
-  -project Overlook.xcodeproj \
-  -scheme Overlook \
-  -configuration "$CONFIG" \
-  build "$@"
+run_xcodebuild() {
+  xcodebuild \
+    -project Overlook.xcodeproj \
+    -scheme Overlook \
+    -configuration "$CONFIG" \
+    "$@"
+}
 
-BUILT_PRODUCTS_DIR=$(xcodebuild \
-  -project Overlook.xcodeproj \
-  -scheme Overlook \
-  -configuration "$CONFIG" \
-  -showBuildSettings build 2>/dev/null \
+echo "Building Overlook ($CONFIG)..."
+run_xcodebuild build "$@"
+
+BUILT_PRODUCTS_DIR=$(run_xcodebuild \
+  -showBuildSettings build "$@" 2>/dev/null \
   | awk -F' = ' '/^[[:space:]]*BUILT_PRODUCTS_DIR =/ {print $2; exit}')
 
-FULL_PRODUCT_NAME=$(xcodebuild \
-  -project Overlook.xcodeproj \
-  -scheme Overlook \
-  -configuration "$CONFIG" \
-  -showBuildSettings build 2>/dev/null \
+FULL_PRODUCT_NAME=$(run_xcodebuild \
+  -showBuildSettings build "$@" 2>/dev/null \
   | awk -F' = ' '/^[[:space:]]*FULL_PRODUCT_NAME =/ {print $2; exit}')
 
 APP_SRC="$BUILT_PRODUCTS_DIR/$FULL_PRODUCT_NAME"

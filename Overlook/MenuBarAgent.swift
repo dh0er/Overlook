@@ -118,15 +118,7 @@ class MenuBarAgent: NSObject, ObservableObject {
         let scanItem = NSMenuItem(title: "Scan for Devices", action: #selector(scanForDevices), keyEquivalent: "r")
         scanItem.target = self
         menu?.addItem(scanItem)
-        
-        menu?.addItem(NSMenuItem.separator())
-        
-        // OCR toggle
-        let ocrItem = NSMenuItem(title: "Enable OCR", action: #selector(toggleOCR), keyEquivalent: "o")
-        ocrItem.target = self
-        ocrItem.tag = 200
-        menu?.addItem(ocrItem)
-        
+
         menu?.addItem(NSMenuItem.separator())
         
         // Preferences
@@ -456,16 +448,7 @@ class MenuBarAgent: NSObject, ObservableObject {
     @objc private func scanForDevices() {
         kvmDeviceManager.scanForDevices()
     }
-    
-    @objc private func toggleOCR() {
-        NotificationCenter.default.post(name: .overlookToggleCopyMode, object: nil)
-        
-        // Update menu item
-        if let ocrItem = menu?.items.first(where: { $0.tag == 200 }) {
-            ocrItem.title = ocrItem.title.contains("Enable") ? "Disable OCR" : "Enable OCR"
-        }
-    }
-    
+
     @objc private func showPreferences() {
         showMainWindow()
     }
@@ -555,12 +538,10 @@ class MenuBarAgent: NSObject, ObservableObject {
     
     private func handleGlobalKeyEvent(_ event: NSEvent) {
         guard event.modifierFlags.contains([.command, .shift]) else { return }
-        
+
         switch event.keyCode {
         case 9: // V key - Quick connect
             showQuickConnect()
-        case 31: // O key - Toggle OCR
-            toggleOCR()
         case 15: // R key - Scan devices
             scanForDevices()
         default:
