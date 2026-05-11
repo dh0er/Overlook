@@ -89,39 +89,36 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         
         isScanning = true
         scanProgress = 0.0
+        let startedAt = Date()
         let pinnedDevices = availableDevices.filter { $0.id.hasPrefix("manual-") || $0.id.hasPrefix("saved-") }
         availableDevices = pinnedDevices
+        OverlookLog.info("scan start pinned=\(pinnedDevices.count)")
         
-        // Start multiple discovery methods
         Task {
             await withTaskGroup(of: [KVMDevice].self) { group in
-                // GL.iNet Comet discovery
                 group.addTask {
                     await self.discoverGLiNetDevices()
                 }
                 
-                // Generic KVM discovery
                 group.addTask {
                     await self.discoverGenericKVMDevices()
                 }
                 
-                // Network scan for known ports
                 group.addTask {
                     await self.scanKnownPorts()
                 }
 
-                // Tailscale network discovery
                 group.addTask {
                     await self.discoverTailscaleDevices()
                 }
                 
-                // Collect results
                 var allDevices: [KVMDevice] = []
                 let pinnedDevices = await MainActor.run {
                     self.availableDevices.filter { $0.id.hasPrefix("manual-") || $0.id.hasPrefix("saved-") }
                 }
 
                 for await devices in group {
+                    OverlookLog.info("scan branch returned count=\(devices.count) devices=\(devices.map { "\($0.name)|\($0.host):\($0.port)" }.joined(separator: ","))")
                     allDevices.append(contentsOf: devices)
 
                     let uniqueDevices = self.removeDuplicates(from: allDevices)
@@ -136,6 +133,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                     self.scanProgress = 1.0
                     self.scanTimer?.invalidate()
                     self.scanTimer = nil
+                    OverlookLog.info("scan complete devices=\(self.availableDevices.count) durationMs=\(Self.elapsedMilliseconds(since: startedAt))")
                 }
             }
         }
@@ -272,18 +270,22 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     private func scanKnownPorts() async -> [KVMDevice] {
         var devices: [KVMDevice] = []
         
-        // Common KVM ports to scan
         let knownPorts = [443, 8443, 80, 8080]
         let localNetwork = getLocalNetworkRange()
+        let scanPrefixes = Set(localNetwork.compactMap { Self.ipv4Prefix(for: $0) })
+        let arpHosts = Self.arpHosts(matching: scanPrefixes)
+        let arpHostSet = Set(arpHosts)
+        let orderedHosts = arpHosts + localNetwork.filter { !arpHostSet.contains($0) }
 
         let maxConcurrent = 64
         var targets: [(host: String, port: Int)] = []
-        targets.reserveCapacity(localNetwork.count * knownPorts.count)
-        for host in localNetwork {
+        targets.reserveCapacity(orderedHosts.count * knownPorts.count)
+        for host in orderedHosts {
             for port in knownPorts {
                 targets.append((host: host, port: port))
             }
         }
+        OverlookLog.info("scan known-ports hosts=\(localNetwork.count) arpHosts=\(arpHosts.joined(separator: ",")) targets=\(targets.count) maxConcurrent=\(maxConcurrent)")
         
         await withTaskGroup(of: KVMDevice?.self) { group in
             var nextIndex = 0
@@ -303,17 +305,70 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                     inFlight -= 1
                     if let device {
                         devices.append(device)
+                        OverlookLog.info("scan found \(device.name) host=\(device.host) port=\(device.port)")
                     }
                 }
             }
         }
+
+        let foundKeys = Set(devices.map { "\($0.host):\($0.port)" })
+        let currentARPHosts = Self.arpHosts(matching: scanPrefixes)
+        let fallbackDevices = await scanARPResolvedHosts(
+            hosts: currentARPHosts,
+            ports: [443, 80],
+            excluding: foundKeys
+        )
+        devices.append(contentsOf: fallbackDevices)
         
+        OverlookLog.info("scan known-ports complete found=\(devices.count)")
         return devices
+    }
+
+    private func scanARPResolvedHosts(hosts: [String], ports: [Int], excluding existingKeys: Set<String>) async -> [KVMDevice] {
+        var devices: [KVMDevice] = []
+        let targets = hosts.flatMap { host in
+            ports.map { port in (host: host, port: port) }
+        }.filter { !existingKeys.contains("\($0.host):\($0.port)") }
+
+        guard !targets.isEmpty else { return [] }
+        OverlookLog.info("scan arp-fallback hosts=\(hosts.joined(separator: ",")) targets=\(targets.count)")
+
+        await withTaskGroup(of: KVMDevice?.self) { group in
+            for target in targets {
+                group.addTask {
+                    await self.checkARPFallbackService(host: target.host, port: target.port)
+                }
+            }
+
+            for await device in group {
+                if let device {
+                    devices.append(device)
+                    OverlookLog.info("scan arp-fallback found \(device.name) host=\(device.host) port=\(device.port)")
+                }
+            }
+        }
+
+        return devices
+    }
+
+    private func checkARPFallbackService(host: String, port: Int) async -> KVMDevice? {
+        guard await probeGLKVMQuick(host: host, port: port) else { return nil }
+        OverlookLog.info("scan glkvm-match source=arp-fallback host=\(host) port=\(port)")
+        return KVMDevice(
+            id: "scanned-\(host)-\(port)",
+            name: "GLKVM @ \(host):\(port)",
+            host: host,
+            port: port,
+            type: .glinetComet,
+            authToken: "",
+            capabilities: [.videoStreaming, .keyboardInput, .mouseInput, .virtualMedia, .powerManagement]
+        )
     }
     
     private func getLocalNetworkRange() -> [String] {
         var prefixes: Set<String> = []
         var hosts: [String] = []
+        var includedInterfaces: [String] = []
 
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&ifaddr) == 0, let first = ifaddr {
@@ -325,8 +380,12 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                 guard let addr = p.pointee.ifa_addr else { continue }
                 if addr.pointee.sa_family != UInt8(AF_INET) { continue }
 
+                let name = String(cString: p.pointee.ifa_name)
                 let flags = Int32(p.pointee.ifa_flags)
                 if (flags & IFF_LOOPBACK) != 0 { continue }
+                if (flags & IFF_POINTOPOINT) != 0 { continue }
+                if (flags & IFF_UP) == 0 || (flags & IFF_RUNNING) == 0 { continue }
+                if Self.isVirtualOrApplePeerInterface(name) { continue }
 
                 var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                 let result = getnameinfo(
@@ -352,6 +411,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
 
                 // Pragmatic /24 scan based on the interface IP.
                 prefixes.insert("\(parts[0]).\(parts[1]).\(parts[2])")
+                includedInterfaces.append("\(name)=\(ip)")
             }
         }
 
@@ -368,6 +428,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         }
 
         let sortedPrefixes = prefixes.sorted()
+        OverlookLog.info("scan prefixes=\(sortedPrefixes.joined(separator: ",")) interfaces=\(includedInterfaces.joined(separator: ","))")
         NSLog("[Overlook scan] scanning prefixes: \(sortedPrefixes)")
 
         for prefix in sortedPrefixes {
@@ -377,6 +438,83 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         }
 
         return hosts
+    }
+
+    nonisolated private static func isVirtualOrApplePeerInterface(_ name: String) -> Bool {
+        let skippedPrefixes = [
+            "anpi",
+            "ap",
+            "awdl",
+            "bridge",
+            "gif",
+            "llw",
+            "lo",
+            "stf",
+            "utun",
+            "vmenet",
+        ]
+        return skippedPrefixes.contains { name.hasPrefix($0) }
+    }
+
+    nonisolated private static func elapsedMilliseconds(since start: Date) -> Int {
+        Int(Date().timeIntervalSince(start) * 1000)
+    }
+
+    nonisolated private static func ipv4Prefix(for host: String) -> String? {
+        let parts = host.split(separator: ".")
+        guard parts.count == 4 else { return nil }
+        return parts.prefix(3).joined(separator: ".")
+    }
+
+    nonisolated private static func arpHosts(matching prefixes: Set<String>) -> [String] {
+        guard !prefixes.isEmpty else { return [] }
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
+        task.arguments = ["-an"]
+
+        let output = Pipe()
+        task.standardOutput = output
+        task.standardError = Pipe()
+
+        do {
+            try task.run()
+        } catch {
+            OverlookLog.error("scan arp failed to launch error=\(OverlookLog.describe(error))")
+            return []
+        }
+
+        task.waitUntilExit()
+        guard task.terminationStatus == 0 else {
+            OverlookLog.error("scan arp exited status=\(task.terminationStatus)")
+            return []
+        }
+
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let text = String(decoding: data, as: UTF8.self)
+        var hosts: Set<String> = []
+
+        for line in text.split(separator: "\n") {
+            if line.contains("(incomplete)") { continue }
+            guard let open = line.firstIndex(of: "("),
+                  let close = line[line.index(after: open)...].firstIndex(of: ")") else {
+                continue
+            }
+
+            let host = String(line[line.index(after: open)..<close])
+            guard let prefix = ipv4Prefix(for: host), prefixes.contains(prefix) else { continue }
+            if host.hasSuffix(".0") || host.hasSuffix(".255") { continue }
+            hosts.insert(host)
+        }
+
+        return hosts.sorted(by: compareIPv4)
+    }
+
+    nonisolated private static func compareIPv4(_ lhs: String, _ rhs: String) -> Bool {
+        let left = lhs.split(separator: ".").compactMap { Int($0) }
+        let right = rhs.split(separator: ".").compactMap { Int($0) }
+        guard left.count == 4, right.count == 4 else { return lhs < rhs }
+        return zip(left, right).first { $0 != $1 }.map { $0 < $1 } ?? false
     }
 
     private func primaryRouteIPv4Prefix() -> String? {
@@ -450,15 +588,23 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         return soError == 0
     }
     
-    private func checkKVMService(host: String, port: Int) async -> KVMDevice? {
-        // Skip the HTTP probes entirely if the TCP port isn't even open.
-        // This is the difference between a 0.7s NWConnection timeout and a
-        // 3s URLSession timeout that also emits a CFNetwork error log line.
-        guard await probeTCPPortOpen(host: host, port: port) else {
-            return nil
+    private func checkKVMService(
+        host: String,
+        port: Int,
+        requiresTCPProbe: Bool = true,
+        source: String = "tcp-scan"
+    ) async -> KVMDevice? {
+        if requiresTCPProbe {
+            guard await probeTCPPortOpen(host: host, port: port) else {
+                return nil
+            }
+            OverlookLog.info("scan tcp-open host=\(host) port=\(port)")
+        } else {
+            OverlookLog.info("scan direct-http source=\(source) host=\(host) port=\(port)")
         }
 
-        if await probeGLKVM(host: host, port: port) {
+        if await probeGLKVM(host: host, port: port, logFailures: !requiresTCPProbe) {
+            OverlookLog.info("scan glkvm-match source=\(source) host=\(host) port=\(port)")
             return KVMDevice(
                 id: "scanned-\(host)-\(port)",
                 name: "GLKVM @ \(host):\(port)",
@@ -471,6 +617,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         }
 
         if await probeWebUIKeywords(host: host, port: port) {
+            OverlookLog.info("scan webui-match source=\(source) host=\(host) port=\(port)")
             return KVMDevice(
                 id: "scanned-\(host)-\(port)",
                 name: "KVM @ \(host):\(port)",
@@ -485,7 +632,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         return nil
     }
 
-    private func probeGLKVM(host: String, port: Int) async -> Bool {
+    private func probeGLKVM(host: String, port: Int, logFailures: Bool = false) async -> Bool {
         let preferredSchemes: [String] = (port == 443 || port == 8443) ? ["https", "http"] : ["http", "https"]
 
         let paths = [
@@ -508,11 +655,47 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                     case 200, 401, 403, 301, 302, 307, 308:
                         return true
                     default:
+                        if logFailures {
+                            OverlookLog.info("scan glkvm-status host=\(host) port=\(port) status=\(http.statusCode) url=\(OverlookLog.redactedURL(url))")
+                        }
                         continue
                     }
                 } catch {
+                    if logFailures {
+                        OverlookLog.error("scan glkvm-error host=\(host) port=\(port) url=\(OverlookLog.redactedURL(url)) error=\(OverlookLog.describe(error))")
+                    }
                     continue
                 }
+            }
+        }
+
+        return false
+    }
+
+    private func probeGLKVMQuick(host: String, port: Int) async -> Bool {
+        let scheme = (port == 443 || port == 8443) ? "https" : "http"
+        let paths = [
+            "api/auth/check",
+            "api/init/is_inited",
+        ]
+
+        for path in paths {
+            guard let url = URL(string: "\(scheme)://\(host):\(port)/\(path)") else { continue }
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 1
+
+            do {
+                let (_, response) = try await probeSession.data(for: request)
+                guard let http = response as? HTTPURLResponse else { continue }
+                switch http.statusCode {
+                case 200, 401, 403, 301, 302, 307, 308:
+                    return true
+                default:
+                    continue
+                }
+            } catch {
+                continue
             }
         }
 
